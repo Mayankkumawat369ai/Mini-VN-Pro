@@ -1,10 +1,14 @@
 package com.mayank.minivnpro
 
 import androidx.media3.common.Effect
+import androidx.media3.common.audio.AudioProcessor
+import androidx.media3.common.audio.SonicAudioProcessor
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.effect.Contrast
 import androidx.media3.effect.RgbAdjustment
 import androidx.media3.effect.RgbFilter
+import androidx.media3.effect.ScaleAndRotateTransformation
+import androidx.media3.effect.SpeedChangeEffect
 
 enum class VideoFilter(val title: String) {
     ORIGINAL("Original"),
@@ -15,11 +19,14 @@ enum class VideoFilter(val title: String) {
     CINEMATIC("Cinematic")
 }
 
+val speedOptions = listOf(0.5f, 0.75f, 1.0f, 1.5f, 2.0f)
+
 @UnstableApi
-fun buildVideoEffects(
+fun buildPreviewVideoEffects(
     filter: VideoFilter,
     brightness: Float,
-    contrast: Float
+    contrast: Float,
+    rotationDegrees: Int
 ): List<Effect> {
     val effects = mutableListOf<Effect>()
 
@@ -77,5 +84,27 @@ fun buildVideoEffects(
         effects.add(Contrast(contrast.coerceIn(-0.7f, 0.7f)))
     }
 
+    if (rotationDegrees % 360 != 0) {
+        effects.add(
+            ScaleAndRotateTransformation.Builder()
+                .setRotationDegrees(rotationDegrees.toFloat())
+                .build()
+        )
+    }
+
     return effects
+}
+
+@UnstableApi
+fun buildSpeedAudioProcessors(speed: Float, removeAudio: Boolean): List<AudioProcessor> {
+    if (speed == 1.0f || removeAudio) return emptyList()
+    val sonic = SonicAudioProcessor()
+    sonic.setSpeed(speed)
+    return listOf(sonic)
+}
+
+@UnstableApi
+fun buildSpeedVideoEffects(speed: Float): List<Effect> {
+    if (speed == 1.0f) return emptyList()
+    return listOf(SpeedChangeEffect(speed))
 }
