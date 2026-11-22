@@ -2,6 +2,7 @@ package com.mayank.minivnpro
 
 import android.content.ContentValues
 import android.content.Context
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -64,10 +65,47 @@ import kotlin.math.roundToInt
 
 data class VideoClip(
     val id: Long,
+    val uri: Uri,
     val startMs: Long,
-    val endMs: Long
+    val endMs: Long,
+    val isImage: Boolean = false
 ) {
     val durationMs: Long get() = (endMs - startMs).coerceAtLeast(0L)
+}
+
+@UnstableApi
+fun VideoClip.toMediaItem(): MediaItem {
+    return if (isImage) {
+        MediaItem.Builder()
+            .setUri(uri)
+            .setImageDurationMs(durationMs.coerceAtLeast(1000L))
+            .build()
+    } else {
+        MediaItem.Builder()
+            .setUri(uri)
+            .setClippingConfiguration(
+                MediaItem.ClippingConfiguration.Builder()
+                    .setStartPositionMs(startMs)
+                    .setEndPositionMs(endMs)
+                    .build()
+            )
+            .build()
+    }
+}
+
+fun getMediaDurationMs(context: Context, uri: Uri): Long {
+    val retriever = MediaMetadataRetriever()
+    return try {
+        retriever.setDataSource(context, uri)
+        retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 5000L
+    } catch (e: Exception) {
+        5000L
+    } finally {
+        try {
+            retriever.release()
+        } catch (_: Exception) {
+        }
+    }
 }
 
 class MainActivity : ComponentActivity() {
@@ -88,10 +126,12 @@ fun MiniVNProApp() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    var videoUri by remember { mutableStateOf<Uri?>(null) }
     var clips by remember { mutableStateOf<List<VideoClip>>(emptyList()) }
     var selectedClipIndex by remember { mutableStateOf(0) }
     var nextClipId by remember { mutableStateOf(1L) }
+
+    // Active bottom panel: NONE, FILTER, SPEED, TEXT, MUSIC
+    var activePanel by remember { mutableStateOf("NONE") }
 
     // Music State
     var audioUri by remember { mutableStateOf<Uri?>(null) }
@@ -99,7 +139,6 @@ fun MiniVNProApp() {
     var audioDurationMs by remember { mutableStateOf(30000L) }
     var audioStartMs by remember { mutableStateOf(0L) }
     var showMusicDialog by remember { mutableStateOf(false) }
-    var showMusicAdjust by remember { mutableStateOf(false) }
     var isAudioPreviewing by remember { mutableStateOf(false) }
 
     // Online Music Search State
@@ -117,20 +156,20 @@ fun MiniVNProApp() {
     var textHasBg by remember { mutableStateOf(true) }
     var previewSize by remember { mutableStateOf(IntSize.Zero) }
     var showTextDialog by remember { mutableStateOf(false) }
-    var showTextAdjust by remember { mutableStateOf(false) }
     var tempTextInput by remember { mutableStateOf("") }
 
-    // Filter & Color Adjust State
+    // Filter, Color, Speed & Rotate State
     var selectedFilter by remember { mutableStateOf(VideoFilter.ORIGINAL) }
     var brightness by remember { mutableStateOf(0f) }
     var contrast by remember { mutableStateOf(0f) }
-    var showFilterPanel by remember { mutableStateOf(false) }
+    var playbackSpeed by remember { mutableStateOf(1.0f) }
+    var rotationDegrees by remember { mutableStateOf(0) }
 
     var isMuted by remember { mutableStateOf(false) }
     var currentTotalPosMs by remember { mutableStateOf(0L) }
     var isPlaying by remember { mutableStateOf(false) }
     var isExporting by remember { mutableStateOf(false) }
-    var statusText by remember { mutableStateOf("नीचे Video पर टैप करके वीडियो चुनें") }
+    var statusText by remember { mutableStateOf("नीचे +Video या +Photo पर टैप करें") }
 
     val totalDurationMs = remember(clips) {
         clips.sumOf { it.durationMs }.coerceAtLeast(1000L)
@@ -140,26 +179,22 @@ fun MiniVNProApp() {
     val audioPlayer = remember { ExoPlayer.Builder(context).build() }
 
     fun loadClipsIntoPlayer(
-        uri: Uri,
         clipList: List<VideoClip>,
         seekClipIdx: Int = 0,
         seekPosInClip: Long = 0L,
         autoPlay: Boolean = false
     ) {
-        val mediaItems = clipList.map { clip ->
-            MediaItem.Builder()
-                .setUri(uri)
-                .setClippingConfiguration(
-                    MediaItem.ClippingConfiguration.Builder()
-                        .setStartPositionMs(clip.startMs)
-                        .setEndPositionMs(clip.endMs)
-                        .build()
-                )
-                .build()
+        if (clipList.isEmpty()) {
+            exoPlayer.clearMediaItems()
+            return
         }
-        val safeIdx = seekClipIdx.coerceIn(0, (clipList.size - 1).coerceAtLeast(0))
-        exoPlayer.setVideoEffects(buildVideoEffects(selectedFilter, brightness, contrast))
+        val mediaItems = clipList.map { it.toMediaItem() }
+        val safeIdx = seekClipIdx.coerceIn(0, clipList.lastIndex)
+        exoPlayer.setVideoEffects(
+            buildPreviewVideoEffects(selectedFilter, brightness, contrast, rotationDegrees)
+        )
         exoPlayer.setMediaItems(mediaItems, safeIdx, seekPosInClip)
+        exoPlayer.setPlaybackSpeed(playbackSpeed)
         exoPlayer.prepare()
         exoPlayer.volume = if (isMuted || audioUri != null) 0f else 1f
         exoPlayer.playWhenReady = autoPlay
@@ -184,7 +219,8 @@ fun MiniVNProApp() {
                 selectedClipIndex = i
                 currentTotalPosMs = targetMs
                 if (audioUri != null) {
-                    audioPlayer.seekTo((audioStartMs + targetMs).coerceAtMost(audioDurationMs))
+                    val audioOffset = (targetMs / playbackSpeed).toLong()
+                    audioPlayer.seekTo((audioStartMs + audioOffset).coerceAtMost(audioDurationMs))
                 }
                 return
             }
@@ -195,11 +231,6 @@ fun MiniVNProApp() {
     DisposableEffect(Unit) {
         val videoListener = object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
-                if (state == Player.STATE_READY && clips.isEmpty() && exoPlayer.duration > 0) {
-                    val dur = exoPlayer.duration
-                    clips = listOf(VideoClip(nextClipId++, 0L, dur))
-                    selectedClipIndex = 0
-                }
                 if (state == Player.STATE_ENDED) {
                     audioPlayer.pause()
                     isAudioPreviewing = false
@@ -233,9 +264,8 @@ fun MiniVNProApp() {
         }
     }
 
-    // Apply Filter / Brightness / Contrast live on preview
-    LaunchedEffect(selectedFilter, brightness, contrast) {
-        val uri = videoUri ?: return@LaunchedEffect
+    // Apply Filter / Brightness / Contrast / Rotate live on preview
+    LaunchedEffect(selectedFilter, brightness, contrast, rotationDegrees) {
         if (clips.isEmpty()) return@LaunchedEffect
         delay(150)
         val idx = exoPlayer.currentMediaItemIndex
@@ -243,12 +273,16 @@ fun MiniVNProApp() {
         val wasPlaying = exoPlayer.isPlaying
         exoPlayer.pause()
         audioPlayer.pause()
-        loadClipsIntoPlayer(uri, clips, idx, pos, wasPlaying)
+        loadClipsIntoPlayer(clips, idx, pos, wasPlaying)
         if (wasPlaying && audioUri != null) {
-            val audioPos = (audioStartMs + getCurrentTotalPosition()).coerceAtMost(audioDurationMs)
+            val audioPos = (audioStartMs + (getCurrentTotalPosition() / playbackSpeed).toLong()).coerceAtMost(audioDurationMs)
             audioPlayer.seekTo(audioPos)
             audioPlayer.play()
         }
+    }
+
+    LaunchedEffect(playbackSpeed) {
+        exoPlayer.setPlaybackSpeed(playbackSpeed)
     }
 
     LaunchedEffect(isPlaying, clips) {
@@ -260,27 +294,46 @@ fun MiniVNProApp() {
         }
     }
 
-    val videoPicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        if (uri != null) {
-            videoUri = uri
-            clips = emptyList()
-            selectedClipIndex = 0
-            currentTotalPosMs = 0L
-            selectedFilter = VideoFilter.ORIGINAL
-            brightness = 0f
-            contrast = 0f
-            exoPlayer.setVideoEffects(emptyList())
-            exoPlayer.setMediaItem(MediaItem.fromUri(uri))
-            exoPlayer.prepare()
-            exoPlayer.volume = if (isMuted || audioUri != null) 0f else 1f
-            exoPlayer.playWhenReady = true
+    // Multi-Video Picker (Can add 2, 3 or more videos at once!)
+    val multiVideoPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            val newClips = uris.map { uri ->
+                val dur = getMediaDurationMs(context, uri)
+                VideoClip(id = nextClipId++, uri = uri, startMs = 0L, endMs = dur, isImage = false)
+            }
+            val startIdx = clips.size
+            val updated = clips + newClips
+            clips = updated
+            selectedClipIndex = startIdx.coerceIn(0, updated.lastIndex)
+            loadClipsIntoPlayer(updated, selectedClipIndex, 0L, true)
             if (audioUri != null) {
                 audioPlayer.seekTo(audioStartMs)
                 audioPlayer.play()
             }
-            statusText = "वीडियो लोड हो गया!"
+            statusText = "${newClips.size} वीडियो क्लिप जुड़ गई!"
+        }
+    }
+
+    // Multi-Photo Picker (Adds photos as 4-second video clips)
+    val multiPhotoPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            val newClips = uris.map { uri ->
+                VideoClip(id = nextClipId++, uri = uri, startMs = 0L, endMs = 4000L, isImage = true)
+            }
+            val startIdx = clips.size
+            val updated = clips + newClips
+            clips = updated
+            selectedClipIndex = startIdx.coerceIn(0, updated.lastIndex)
+            loadClipsIntoPlayer(updated, selectedClipIndex, 0L, true)
+            if (audioUri != null) {
+                audioPlayer.seekTo(audioStartMs)
+                audioPlayer.play()
+            }
+            statusText = "${newClips.size} फोटो जुड़ गई (4s प्रत्येक)!"
         }
     }
 
@@ -295,9 +348,7 @@ fun MiniVNProApp() {
             audioPlayer.prepare()
             exoPlayer.volume = 0f
             showMusicDialog = false
-            showTextAdjust = false
-            showFilterPanel = false
-            showMusicAdjust = true
+            activePanel = "MUSIC"
             statusText = "म्यूज़िक जुड़ गया!"
         }
     }
@@ -308,12 +359,7 @@ fun MiniVNProApp() {
             onDismissRequest = { showTextDialog = false },
             containerColor = Color(0xFF1A1A20),
             title = {
-                Text(
-                    text = "वीडियो पर टेक्स्ट लिखें",
-                    color = Color.White,
-                    fontSize = 17.sp,
-                    fontWeight = FontWeight.Bold
-                )
+                Text("वीडियो पर टेक्स्ट लिखें", color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold)
             },
             text = {
                 OutlinedTextField(
@@ -333,12 +379,10 @@ fun MiniVNProApp() {
                     overlayText = tempTextInput.trim()
                     showTextDialog = false
                     if (overlayText.isNotBlank()) {
-                        showMusicAdjust = false
-                        showFilterPanel = false
-                        showTextAdjust = true
+                        activePanel = "TEXT"
                         statusText = "टेक्स्ट को उंगली से खींचकर सेट करें!"
                     } else {
-                        showTextAdjust = false
+                        if (activePanel == "TEXT") activePanel = "NONE"
                         statusText = "टेक्स्ट हटा दिया गया"
                     }
                 }) {
@@ -359,12 +403,7 @@ fun MiniVNProApp() {
             onDismissRequest = { showMusicDialog = false },
             containerColor = Color(0xFF1A1A20),
             title = {
-                Text(
-                    text = "गाना सर्च करें",
-                    color = Color.White,
-                    fontSize = 17.sp,
-                    fontWeight = FontWeight.Bold
-                )
+                Text("गाना सर्च करें", color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold)
             },
             text = {
                 Column(modifier = Modifier.fillMaxWidth().heightIn(max = 400.dp)) {
@@ -455,9 +494,7 @@ fun MiniVNProApp() {
                                                     audioPlayer.prepare()
                                                     exoPlayer.volume = 0f
                                                     showMusicDialog = false
-                                                    showTextAdjust = false
-                                                    showFilterPanel = false
-                                                    showMusicAdjust = true
+                                                    activePanel = "MUSIC"
                                                     statusText = "गाना: ${song.title}"
                                                 } else {
                                                     Toast.makeText(context, "गाना लोड नहीं हो सका", Toast.LENGTH_SHORT).show()
@@ -516,15 +553,10 @@ fun MiniVNProApp() {
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Text(
-                text = "Mini VN Pro",
-                color = Color.White,
-                fontSize = 18.sp,
-                fontWeight = FontWeight.Bold
-            )
+            Text("Mini VN Pro", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
 
             Text(
-                text = if (selectedFilter != VideoFilter.ORIGINAL) selectedFilter.title else if (clips.isEmpty()) "Original" else "${clips.size} Clip${if (clips.size > 1) "s" else ""}",
+                text = if (playbackSpeed != 1.0f) "${playbackSpeed}x" else if (clips.isEmpty()) "Original" else "${clips.size} Clip${if (clips.size > 1) "s" else ""}",
                 color = Color(0xFFFFD600),
                 fontSize = 12.sp,
                 modifier = Modifier
@@ -534,9 +566,8 @@ fun MiniVNProApp() {
 
             Button(
                 onClick = {
-                    val uri = videoUri
-                    if (uri == null || clips.isEmpty()) {
-                        Toast.makeText(context, "पहले कोई वीडियो चुनें", Toast.LENGTH_SHORT).show()
+                    if (clips.isEmpty()) {
+                        Toast.makeText(context, "पहले कोई वीडियो या फोटो चुनें", Toast.LENGTH_SHORT).show()
                     } else if (!isExporting) {
                         exoPlayer.pause()
                         audioPlayer.pause()
@@ -545,7 +576,6 @@ fun MiniVNProApp() {
                         statusText = "HD MP4 बन रहा है..."
                         exportVideoClips(
                             context = context,
-                            videoUri = uri,
                             clips = clips,
                             audioUri = audioUri,
                             audioStartMs = audioStartMs,
@@ -554,6 +584,8 @@ fun MiniVNProApp() {
                             filter = selectedFilter,
                             brightness = brightness,
                             contrast = contrast,
+                            rotationDegrees = rotationDegrees,
+                            speed = playbackSpeed,
                             overlayText = overlayText,
                             textAnchorX = textNormX,
                             textAnchorY = -textNormY,
@@ -592,7 +624,7 @@ fun MiniVNProApp() {
                 .onSizeChanged { previewSize = it },
             contentAlignment = Alignment.Center
         ) {
-            if (videoUri != null) {
+            if (clips.isNotEmpty()) {
                 AndroidView(
                     factory = { ctx ->
                         PlayerView(ctx).apply {
@@ -604,18 +636,12 @@ fun MiniVNProApp() {
                 )
             } else {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(
-                        Icons.Default.VideoLibrary,
-                        contentDescription = null,
-                        tint = Color.Gray,
-                        modifier = Modifier.size(56.dp)
-                    )
+                    Icon(Icons.Default.VideoLibrary, contentDescription = null, tint = Color.Gray, modifier = Modifier.size(56.dp))
                     Spacer(Modifier.height(8.dp))
-                    Text("कोई वीडियो नहीं चुना गया", color = Color.Gray, fontSize = 14.sp)
+                    Text("कोई वीडियो या फोटो नहीं चुना गया", color = Color.Gray, fontSize = 14.sp)
                 }
             }
 
-            // Draggable Text
             if (overlayText.isNotBlank()) {
                 val bgCol = when {
                     !textHasBg -> Color.Transparent
@@ -639,14 +665,10 @@ fun MiniVNProApp() {
                                 }
                             }
                         }
-                        .clickable {
-                            showMusicAdjust = false
-                            showFilterPanel = false
-                            showTextAdjust = true
-                        }
+                        .clickable { activePanel = "TEXT" }
                         .border(
-                            width = if (showTextAdjust) 1.dp else 0.dp,
-                            color = if (showTextAdjust) Color(0xAAFFD600) else Color.Transparent,
+                            width = if (activePanel == "TEXT") 1.dp else 0.dp,
+                            color = if (activePanel == "TEXT") Color(0xAAFFD600) else Color.Transparent,
                             shape = RoundedCornerShape(6.dp)
                         )
                         .background(bgCol, RoundedCornerShape(6.dp))
@@ -663,9 +685,7 @@ fun MiniVNProApp() {
 
             if (isExporting) {
                 Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(Color(0xAA000000)),
+                    modifier = Modifier.fillMaxSize().background(Color(0xAA000000)),
                     contentAlignment = Alignment.Center
                 ) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -677,7 +697,7 @@ fun MiniVNProApp() {
             }
         }
 
-        // 3. Playback Control & Precision Seek Bar
+        // 3. Playback Control & Seek Bar
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -697,7 +717,7 @@ fun MiniVNProApp() {
 
                 IconButton(
                     onClick = {
-                        if (videoUri != null && clips.isNotEmpty()) {
+                        if (clips.isNotEmpty()) {
                             isAudioPreviewing = false
                             if (exoPlayer.isPlaying) {
                                 exoPlayer.pause()
@@ -708,8 +728,8 @@ fun MiniVNProApp() {
                                 }
                                 exoPlayer.play()
                                 if (audioUri != null) {
-                                    val audioPos = (audioStartMs + getCurrentTotalPosition()).coerceAtMost(audioDurationMs)
-                                    audioPlayer.seekTo(audioPos)
+                                    val audioOffset = (getCurrentTotalPosition() / playbackSpeed).toLong()
+                                    audioPlayer.seekTo((audioStartMs + audioOffset).coerceAtMost(audioDurationMs))
                                     audioPlayer.play()
                                 }
                             }
@@ -751,8 +771,46 @@ fun MiniVNProApp() {
             )
         }
 
-        // 4A. VN Filter & Color Adjust Panel
-        if (showFilterPanel) {
+        // 4A. Speed Panel
+        if (activePanel == "SPEED") {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF1A1A22))
+                    .padding(horizontal = 14.dp, vertical = 10.dp)
+            ) {
+                Text("वीडियो स्पीड (Slow-Mo / Fast)", color = Color(0xFFFFD600), fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceEvenly
+                ) {
+                    speedOptions.forEach { sp ->
+                        val selected = playbackSpeed == sp
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(if (selected) Color(0xFF2979FF) else Color(0xFF2A2A34))
+                                .clickable {
+                                    playbackSpeed = sp
+                                    statusText = "Speed: ${sp}x"
+                                }
+                                .padding(horizontal = 14.dp, vertical = 8.dp)
+                        ) {
+                            Text(
+                                text = "${sp}x",
+                                color = Color.White,
+                                fontSize = 12.sp,
+                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4B. Filter & Color Adjust Panel
+        if (activePanel == "FILTER") {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -764,12 +822,7 @@ fun MiniVNProApp() {
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Text(
-                        text = "VN Filters & Color Adjust",
-                        color = Color(0xFFFFD600),
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Medium
-                    )
+                    Text("VN Filters & Color Adjust", color = Color(0xFFFFD600), fontSize = 11.sp, fontWeight = FontWeight.Medium)
                     Text(
                         text = "Reset",
                         color = Color(0xFF2979FF),
@@ -786,11 +839,8 @@ fun MiniVNProApp() {
 
                 Spacer(Modifier.height(6.dp))
 
-                // Filter Chips
                 Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState()),
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     VideoFilter.values().forEach { filter ->
@@ -805,54 +855,39 @@ fun MiniVNProApp() {
                                 }
                                 .padding(horizontal = 12.dp, vertical = 6.dp)
                         ) {
-                            Text(
-                                text = filter.title,
-                                color = Color.White,
-                                fontSize = 12.sp,
-                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
-                            )
+                            Text(filter.title, color = Color.White, fontSize = 12.sp, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal)
                         }
                     }
                 }
 
                 Spacer(Modifier.height(6.dp))
 
-                // Brightness Slider
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("Bright", color = Color.LightGray, fontSize = 11.sp, modifier = Modifier.width(48.dp))
                     Slider(
                         value = brightness,
                         onValueChange = { brightness = it },
                         valueRange = -0.5f..0.5f,
-                        colors = SliderDefaults.colors(
-                            thumbColor = Color(0xFFFFD600),
-                            activeTrackColor = Color(0xFFFFD600),
-                            inactiveTrackColor = Color(0xFF3E3E4A)
-                        ),
+                        colors = SliderDefaults.colors(thumbColor = Color(0xFFFFD600), activeTrackColor = Color(0xFFFFD600)),
                         modifier = Modifier.weight(1f).height(24.dp)
                     )
                 }
 
-                // Contrast Slider
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("Contrast", color = Color.LightGray, fontSize = 11.sp, modifier = Modifier.width(48.dp))
                     Slider(
                         value = contrast,
                         onValueChange = { contrast = it },
                         valueRange = -0.5f..0.5f,
-                        colors = SliderDefaults.colors(
-                            thumbColor = Color(0xFF40C4FF),
-                            activeTrackColor = Color(0xFF40C4FF),
-                            inactiveTrackColor = Color(0xFF3E3E4A)
-                        ),
+                        colors = SliderDefaults.colors(thumbColor = Color(0xFF40C4FF), activeTrackColor = Color(0xFF40C4FF)),
                         modifier = Modifier.weight(1f).height(24.dp)
                     )
                 }
             }
         }
 
-        // 4B. Text Adjust Panel
-        if (showTextAdjust && overlayText.isNotBlank()) {
+        // 4C. Text Adjust Panel
+        if (activePanel == "TEXT" && overlayText.isNotBlank()) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -864,12 +899,7 @@ fun MiniVNProApp() {
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Text(
-                        text = "टेक्स्ट एडजस्ट (उंगली से जगह बदलें)",
-                        color = Color(0xFFFFD600),
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Medium
-                    )
+                    Text("टेक्स्ट एडजस्ट (उंगली से जगह बदलें)", color = Color(0xFFFFD600), fontSize = 11.sp, fontWeight = FontWeight.Medium)
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text(
                             text = if (textHasBg) "Box: ON" else "Box: OFF",
@@ -893,7 +923,7 @@ fun MiniVNProApp() {
                             fontSize = 11.sp,
                             modifier = Modifier.clickable {
                                 overlayText = ""
-                                showTextAdjust = false
+                                activePanel = "NONE"
                                 statusText = "टेक्स्ट हटा दिया गया"
                             }
                         )
@@ -904,11 +934,7 @@ fun MiniVNProApp() {
                     value = textScale,
                     onValueChange = { textScale = it },
                     valueRange = 0.6f..2.2f,
-                    colors = SliderDefaults.colors(
-                        thumbColor = Color(0xFFFFD600),
-                        activeTrackColor = Color(0xFFFFD600),
-                        inactiveTrackColor = Color(0xFF4A4635)
-                    ),
+                    colors = SliderDefaults.colors(thumbColor = Color(0xFFFFD600), activeTrackColor = Color(0xFFFFD600)),
                     modifier = Modifier.height(26.dp)
                 )
 
@@ -925,11 +951,7 @@ fun MiniVNProApp() {
                                 .size(24.dp)
                                 .clip(CircleShape)
                                 .background(col)
-                                .border(
-                                    width = if (selected) 2.5.dp else 1.dp,
-                                    color = if (selected) Color(0xFF2979FF) else Color.Gray,
-                                    shape = CircleShape
-                                )
+                                .border(if (selected) 2.5.dp else 1.dp, if (selected) Color(0xFF2979FF) else Color.Gray, CircleShape)
                                 .clickable { textColor = col }
                         )
                     }
@@ -937,8 +959,8 @@ fun MiniVNProApp() {
             }
         }
 
-        // 4C. Music Start-Time Adjust Panel
-        if (showMusicAdjust && audioUri != null) {
+        // 4D. Music Start-Time Adjust Panel
+        if (activePanel == "MUSIC" && audioUri != null) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -985,7 +1007,7 @@ fun MiniVNProApp() {
                                 audioTitle = ""
                                 audioStartMs = 0L
                                 isAudioPreviewing = false
-                                showMusicAdjust = false
+                                activePanel = "NONE"
                                 exoPlayer.volume = if (isMuted) 0f else 1f
                                 statusText = "म्यूज़िक हटा दिया गया"
                             }
@@ -1001,24 +1023,20 @@ fun MiniVNProApp() {
                         audioPlayer.seekTo(audioStartMs)
                     },
                     valueRange = 0f..maxStart,
-                    colors = SliderDefaults.colors(
-                        thumbColor = Color(0xFF4CAF50),
-                        activeTrackColor = Color(0xFF4CAF50),
-                        inactiveTrackColor = Color(0xFF3A4A3E)
-                    ),
+                    colors = SliderDefaults.colors(thumbColor = Color(0xFF4CAF50), activeTrackColor = Color(0xFF4CAF50)),
                     modifier = Modifier.height(28.dp)
                 )
             }
         }
 
-        // 5. VN-Style Timeline (Music + Text + Video Clips)
+        // 5. VN-Style Timeline (Music + Text + Multi-Clips)
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .background(Color(0xFF121215))
                 .padding(horizontal = 12.dp, vertical = 8.dp)
         ) {
-            // Music Track Bar
+            // Music Track
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1026,9 +1044,7 @@ fun MiniVNProApp() {
                     .background(Color(0xFF222228))
                     .clickable {
                         if (audioUri != null) {
-                            showTextAdjust = false
-                            showFilterPanel = false
-                            showMusicAdjust = !showMusicAdjust
+                            activePanel = if (activePanel == "MUSIC") "NONE" else "MUSIC"
                         } else {
                             showMusicDialog = true
                         }
@@ -1037,16 +1053,8 @@ fun MiniVNProApp() {
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Icon(
-                        Icons.Default.MusicNote,
-                        contentDescription = null,
-                        tint = if (audioUri != null) Color(0xFF4CAF50) else Color.LightGray,
-                        modifier = Modifier.size(17.dp)
-                    )
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                    Icon(Icons.Default.MusicNote, contentDescription = null, tint = if (audioUri != null) Color(0xFF4CAF50) else Color.LightGray, modifier = Modifier.size(17.dp))
                     Spacer(Modifier.width(8.dp))
                     Text(
                         text = if (audioUri != null) "$audioTitle (${formatTime(audioStartMs)})" else "Tap to search & add music",
@@ -1058,19 +1066,13 @@ fun MiniVNProApp() {
                 }
                 if (audioUri != null) {
                     Spacer(Modifier.width(8.dp))
-                    Text(
-                        text = "बदलें",
-                        color = Color(0xFF2979FF),
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.clickable { showMusicDialog = true }
-                    )
+                    Text("बदलें", color = Color(0xFF2979FF), fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.clickable { showMusicDialog = true })
                 }
             }
 
             Spacer(Modifier.height(6.dp))
 
-            // Text / Subtitle Track Bar
+            // Text Track
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1078,9 +1080,7 @@ fun MiniVNProApp() {
                     .background(Color(0xFF222228))
                     .clickable {
                         if (overlayText.isNotBlank()) {
-                            showMusicAdjust = false
-                            showFilterPanel = false
-                            showTextAdjust = !showTextAdjust
+                            activePanel = if (activePanel == "TEXT") "NONE" else "TEXT"
                         } else {
                             tempTextInput = ""
                             showTextDialog = true
@@ -1090,16 +1090,8 @@ fun MiniVNProApp() {
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Icon(
-                        Icons.Default.Title,
-                        contentDescription = null,
-                        tint = if (overlayText.isNotBlank()) Color(0xFFFFD600) else Color.LightGray,
-                        modifier = Modifier.size(17.dp)
-                    )
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                    Icon(Icons.Default.Title, contentDescription = null, tint = if (overlayText.isNotBlank()) Color(0xFFFFD600) else Color.LightGray, modifier = Modifier.size(17.dp))
                     Spacer(Modifier.width(8.dp))
                     Text(
                         text = if (overlayText.isNotBlank()) "Text: $overlayText" else "Tap to add text / subtitle",
@@ -1111,22 +1103,16 @@ fun MiniVNProApp() {
                 }
                 if (overlayText.isNotBlank()) {
                     Spacer(Modifier.width(8.dp))
-                    Text(
-                        text = "Edit",
-                        color = Color(0xFF2979FF),
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.clickable {
-                            tempTextInput = overlayText
-                            showTextDialog = true
-                        }
-                    )
+                    Text("Edit", color = Color(0xFF2979FF), fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.clickable {
+                        tempTextInput = overlayText
+                        showTextDialog = true
+                    })
                 }
             }
 
             Spacer(Modifier.height(8.dp))
 
-            // Video Clips Strip
+            // Multi-Video & Photo Clips Strip
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1145,7 +1131,7 @@ fun MiniVNProApp() {
                             .border(1.dp, Color(0xFF3A3A44), RoundedCornerShape(8.dp)),
                         contentAlignment = Alignment.Center
                     ) {
-                        Text("Video Timeline", color = Color.Gray, fontSize = 12.sp)
+                        Text("Video / Photo Timeline", color = Color.Gray, fontSize = 12.sp)
                     }
                 } else {
                     clips.forEachIndexed { index, clip ->
@@ -1156,7 +1142,13 @@ fun MiniVNProApp() {
                                 .fillMaxHeight()
                                 .width(clipWidth)
                                 .clip(RoundedCornerShape(8.dp))
-                                .background(if (isSelected) Color(0xFF2D2B1E) else Color(0xFF22222A))
+                                .background(
+                                    when {
+                                        isSelected -> Color(0xFF2D2B1E)
+                                        clip.isImage -> Color(0xFF1E2630)
+                                        else -> Color(0xFF22222A)
+                                    }
+                                )
                                 .border(
                                     width = if (isSelected) 2.dp else 1.dp,
                                     color = if (isSelected) Color(0xFFFFD600) else Color(0xFF444450),
@@ -1172,7 +1164,12 @@ fun MiniVNProApp() {
                                 .padding(horizontal = 8.dp, vertical = 4.dp),
                             verticalArrangement = Arrangement.Center
                         ) {
-                            Text("Clip ${index + 1}", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            Text(
+                                text = if (clip.isImage) "Photo ${index + 1}" else "Clip ${index + 1}",
+                                color = Color.White,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
                             Text(formatTime(clip.durationMs), color = Color(0xFFFFD600), fontSize = 10.sp)
                         }
                     }
@@ -1189,18 +1186,37 @@ fun MiniVNProApp() {
                 .padding(horizontal = 8.dp, vertical = 8.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            ToolButton(Icons.Default.VideoCall, "Video") {
-                videoPicker.launch(arrayOf("video/*"))
+            ToolButton(Icons.Default.VideoCall, "+Video") {
+                multiVideoPicker.launch(arrayOf("video/*"))
+            }
+
+            ToolButton(Icons.Default.AddPhotoAlternate, "+Photo", tint = Color(0xFF40C4FF)) {
+                multiPhotoPicker.launch(arrayOf("image/*"))
             }
 
             ToolButton(
                 icon = Icons.Default.AutoAwesome,
                 label = "Filter",
-                tint = if (showFilterPanel || selectedFilter != VideoFilter.ORIGINAL || brightness != 0f || contrast != 0f) Color(0xFFFFD600) else Color.White
+                tint = if (activePanel == "FILTER" || selectedFilter != VideoFilter.ORIGINAL || brightness != 0f || contrast != 0f) Color(0xFFFFD600) else Color.White
             ) {
-                showMusicAdjust = false
-                showTextAdjust = false
-                showFilterPanel = !showFilterPanel
+                activePanel = if (activePanel == "FILTER") "NONE" else "FILTER"
+            }
+
+            ToolButton(
+                icon = Icons.Default.Speed,
+                label = "Speed",
+                tint = if (activePanel == "SPEED" || playbackSpeed != 1.0f) Color(0xFFFFD600) else Color.White
+            ) {
+                activePanel = if (activePanel == "SPEED") "NONE" else "SPEED"
+            }
+
+            ToolButton(
+                icon = Icons.Default.RotateRight,
+                label = "Rotate",
+                tint = if (rotationDegrees % 360 != 0) Color(0xFFFFD600) else Color.White
+            ) {
+                rotationDegrees = (rotationDegrees + 90) % 360
+                statusText = "Rotate: ${rotationDegrees}°"
             }
 
             ToolButton(
@@ -1220,15 +1236,12 @@ fun MiniVNProApp() {
                     tempTextInput = ""
                     showTextDialog = true
                 } else {
-                    showMusicAdjust = false
-                    showFilterPanel = false
-                    showTextAdjust = !showTextAdjust
+                    activePanel = if (activePanel == "TEXT") "NONE" else "TEXT"
                 }
             }
 
             ToolButton(Icons.Default.ContentCut, "Split", tint = Color(0xFFFFD600)) {
-                val uri = videoUri
-                if (uri != null && clips.isNotEmpty()) {
+                if (clips.isNotEmpty()) {
                     val idx = exoPlayer.currentMediaItemIndex.coerceIn(0, clips.lastIndex)
                     val posInClip = exoPlayer.currentPosition
                     val clip = clips[idx]
@@ -1236,8 +1249,8 @@ fun MiniVNProApp() {
                     if (splitPoint - clip.startMs >= 400L && clip.endMs - splitPoint >= 400L) {
                         exoPlayer.pause()
                         audioPlayer.pause()
-                        val leftClip = VideoClip(nextClipId++, clip.startMs, splitPoint)
-                        val rightClip = VideoClip(nextClipId++, splitPoint, clip.endMs)
+                        val leftClip = VideoClip(nextClipId++, clip.uri, clip.startMs, splitPoint, clip.isImage)
+                        val rightClip = VideoClip(nextClipId++, clip.uri, splitPoint, clip.endMs, clip.isImage)
                         val updated = clips.toMutableList().apply {
                             removeAt(idx)
                             add(idx, rightClip)
@@ -1245,7 +1258,7 @@ fun MiniVNProApp() {
                         }
                         clips = updated
                         selectedClipIndex = idx + 1
-                        loadClipsIntoPlayer(uri, updated, idx + 1, 0L, false)
+                        loadClipsIntoPlayer(updated, idx + 1, 0L, false)
                         statusText = "क्लिप Split हो गई!"
                     } else {
                         Toast.makeText(context, "स्लाइडर को क्लिप के थोड़ा बीच में ले जाएँ", Toast.LENGTH_SHORT).show()
@@ -1254,32 +1267,35 @@ fun MiniVNProApp() {
             }
 
             ToolButton(Icons.Default.Delete, "Delete", tint = Color(0xFFFF5252)) {
-                val uri = videoUri
-                if (uri != null && clips.size > 1 && selectedClipIndex in clips.indices) {
+                if (clips.isNotEmpty() && selectedClipIndex in clips.indices) {
                     exoPlayer.pause()
                     audioPlayer.pause()
                     val updated = clips.toMutableList().apply { removeAt(selectedClipIndex) }
                     clips = updated
-                    val newIdx = selectedClipIndex.coerceAtMost(updated.lastIndex)
-                    selectedClipIndex = newIdx
-                    loadClipsIntoPlayer(uri, updated, newIdx, 0L, false)
-                    statusText = "क्लिप डिलीट हो गई!"
-                } else {
-                    Toast.makeText(context, "पहले Split करें (कम से कम 1 क्लिप रहनी चाहिए)", Toast.LENGTH_SHORT).show()
+                    if (updated.isEmpty()) {
+                        selectedClipIndex = 0
+                        currentTotalPosMs = 0L
+                        exoPlayer.clearMediaItems()
+                        statusText = "सारी क्लिप्स हट गईं"
+                    } else {
+                        val newIdx = selectedClipIndex.coerceAtMost(updated.lastIndex)
+                        selectedClipIndex = newIdx
+                        loadClipsIntoPlayer(updated, newIdx, 0L, false)
+                        statusText = "क्लिप डिलीट हो गई!"
+                    }
                 }
             }
 
             ToolButton(Icons.Default.ContentCopy, "Duplicate") {
-                val uri = videoUri
-                if (uri != null && selectedClipIndex in clips.indices) {
+                if (selectedClipIndex in clips.indices) {
                     exoPlayer.pause()
                     audioPlayer.pause()
                     val clip = clips[selectedClipIndex]
-                    val copy = VideoClip(nextClipId++, clip.startMs, clip.endMs)
+                    val copy = VideoClip(nextClipId++, clip.uri, clip.startMs, clip.endMs, clip.isImage)
                     val updated = clips.toMutableList().apply { add(selectedClipIndex + 1, copy) }
                     clips = updated
                     selectedClipIndex += 1
-                    loadClipsIntoPlayer(uri, updated, selectedClipIndex, 0L, false)
+                    loadClipsIntoPlayer(updated, selectedClipIndex, 0L, false)
                     statusText = "क्लिप कॉपी हो गई!"
                 }
             }
@@ -1325,7 +1341,6 @@ fun formatTime(ms: Long): String {
 @UnstableApi
 fun exportVideoClips(
     context: Context,
-    videoUri: Uri,
     clips: List<VideoClip>,
     audioUri: Uri?,
     audioStartMs: Long,
@@ -1334,6 +1349,8 @@ fun exportVideoClips(
     filter: VideoFilter,
     brightness: Float,
     contrast: Float,
+    rotationDegrees: Int,
+    speed: Float,
     overlayText: String,
     textAnchorX: Float,
     textAnchorY: Float,
@@ -1344,9 +1361,11 @@ fun exportVideoClips(
     onError: (String) -> Unit
 ) {
     val tempFile = File(context.cacheDir, "MiniVNPro_${System.currentTimeMillis()}.mp4")
-    val totalDuration = clips.sumOf { it.durationMs }.coerceAtLeast(500L)
+    val rawDuration = clips.sumOf { it.durationMs }.coerceAtLeast(500L)
+    val effectiveDuration = (rawDuration / speed).toLong().coerceAtLeast(500L)
 
-    val allEffects = buildVideoEffects(filter, brightness, contrast) +
+    val baseVideoEffects = buildPreviewVideoEffects(filter, brightness, contrast, rotationDegrees) +
+        buildSpeedVideoEffects(speed) +
         buildTextExportEffects(
             text = overlayText,
             anchorX = textAnchorX,
@@ -1357,21 +1376,19 @@ fun exportVideoClips(
         )
 
     val editedClips = clips.map { clip ->
-        val mediaItem = MediaItem.Builder()
-            .setUri(videoUri)
-            .setClippingConfiguration(
-                MediaItem.ClippingConfiguration.Builder()
-                    .setStartPositionMs(clip.startMs)
-                    .setEndPositionMs(clip.endMs)
-                    .build()
-            )
-            .build()
+        val removeClipAudio = clip.isImage || muteOriginal || audioUri != null
+        val audioProcessors = buildSpeedAudioProcessors(speed, removeClipAudio)
 
-        val builder = EditedMediaItem.Builder(mediaItem)
-            .setRemoveAudio(muteOriginal || audioUri != null)
+        val builder = EditedMediaItem.Builder(clip.toMediaItem())
+            .setRemoveAudio(removeClipAudio)
 
-        if (allEffects.isNotEmpty()) {
-            builder.setEffects(Effects(emptyList(), allEffects))
+        if (clip.isImage) {
+            builder.setDurationUs(clip.durationMs.coerceAtLeast(1000L) * 1000L)
+            builder.setFrameRate(30)
+        }
+
+        if (baseVideoEffects.isNotEmpty() || audioProcessors.isNotEmpty()) {
+            builder.setEffects(Effects(audioProcessors, baseVideoEffects))
         }
         builder.build()
     }
@@ -1406,8 +1423,8 @@ fun exportVideoClips(
     if (audioUri != null) {
         val clipConfig = MediaItem.ClippingConfiguration.Builder()
             .setStartPositionMs(audioStartMs)
-        if (audioDurationMs > 0 && audioStartMs + totalDuration < audioDurationMs) {
-            clipConfig.setEndPositionMs(audioStartMs + totalDuration)
+        if (audioDurationMs > 0 && audioStartMs + effectiveDuration < audioDurationMs) {
+            clipConfig.setEndPositionMs(audioStartMs + effectiveDuration)
         }
 
         val audioMediaItem = MediaItem.Builder()
