@@ -17,6 +17,8 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -30,6 +32,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -46,6 +49,7 @@ import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.Transformer
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.io.File
 import java.io.FileInputStream
 import java.util.Locale
@@ -74,11 +78,27 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun MiniVNProApp() {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
 
     var videoUri by remember { mutableStateOf<Uri?>(null) }
     var clips by remember { mutableStateOf<List<VideoClip>>(emptyList()) }
     var selectedClipIndex by remember { mutableStateOf(0) }
     var nextClipId by remember { mutableStateOf(1L) }
+
+    // Music State
+    var audioUri by remember { mutableStateOf<Uri?>(null) }
+    var audioTitle by remember { mutableStateOf("") }
+    var audioDurationMs by remember { mutableStateOf(30000L) }
+    var audioStartMs by remember { mutableStateOf(0L) }
+    var showMusicDialog by remember { mutableStateOf(false) }
+    var showMusicAdjust by remember { mutableStateOf(false) }
+    var isAudioPreviewing by remember { mutableStateOf(false) }
+
+    // Online Music Search State
+    var searchQuery by remember { mutableStateOf("") }
+    var searchResults by remember { mutableStateOf<List<OnlineSong>>(emptyList()) }
+    var isSearching by remember { mutableStateOf(false) }
+    var isDownloadingSong by remember { mutableStateOf(false) }
 
     var isMuted by remember { mutableStateOf(false) }
     var currentTotalPosMs by remember { mutableStateOf(0L) }
@@ -91,6 +111,7 @@ fun MiniVNProApp() {
     }
 
     val exoPlayer = remember { ExoPlayer.Builder(context).build() }
+    val audioPlayer = remember { ExoPlayer.Builder(context).build() }
 
     fun loadClipsIntoPlayer(
         uri: Uri,
@@ -113,7 +134,7 @@ fun MiniVNProApp() {
         val safeIdx = seekClipIdx.coerceIn(0, (clipList.size - 1).coerceAtLeast(0))
         exoPlayer.setMediaItems(mediaItems, safeIdx, seekPosInClip)
         exoPlayer.prepare()
-        exoPlayer.volume = if (isMuted) 0f else 1f
+        exoPlayer.volume = if (isMuted || audioUri != null) 0f else 1f
         exoPlayer.playWhenReady = autoPlay
     }
 
@@ -135,6 +156,9 @@ fun MiniVNProApp() {
                 exoPlayer.seekTo(i, offset)
                 selectedClipIndex = i
                 currentTotalPosMs = targetMs
+                if (audioUri != null) {
+                    audioPlayer.seekTo((audioStartMs + targetMs).coerceAtMost(audioDurationMs))
+                }
                 return
             }
             acc += dur
@@ -142,23 +166,43 @@ fun MiniVNProApp() {
     }
 
     DisposableEffect(Unit) {
-        val listener = object : Player.Listener {
+        val videoListener = object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
                 if (state == Player.STATE_READY && clips.isEmpty() && exoPlayer.duration > 0) {
                     val dur = exoPlayer.duration
                     clips = listOf(VideoClip(nextClipId++, 0L, dur))
                     selectedClipIndex = 0
                 }
+                if (state == Player.STATE_ENDED) {
+                    audioPlayer.pause()
+                    isAudioPreviewing = false
+                }
             }
 
             override fun onIsPlayingChanged(playing: Boolean) {
                 isPlaying = playing
+                if (!playing && !isAudioPreviewing) {
+                    audioPlayer.pause()
+                }
             }
         }
-        exoPlayer.addListener(listener)
+        val audioListener = object : Player.Listener {
+            override fun onPlaybackStateChanged(state: Int) {
+                if (state == Player.STATE_READY && audioPlayer.duration > 0) {
+                    audioDurationMs = audioPlayer.duration
+                }
+                if (state == Player.STATE_ENDED) {
+                    isAudioPreviewing = false
+                }
+            }
+        }
+        exoPlayer.addListener(videoListener)
+        audioPlayer.addListener(audioListener)
         onDispose {
-            exoPlayer.removeListener(listener)
+            exoPlayer.removeListener(videoListener)
+            audioPlayer.removeListener(audioListener)
             exoPlayer.release()
+            audioPlayer.release()
         }
     }
 
@@ -181,10 +225,176 @@ fun MiniVNProApp() {
             currentTotalPosMs = 0L
             exoPlayer.setMediaItem(MediaItem.fromUri(uri))
             exoPlayer.prepare()
-            exoPlayer.volume = if (isMuted) 0f else 1f
+            exoPlayer.volume = if (isMuted || audioUri != null) 0f else 1f
             exoPlayer.playWhenReady = true
+            if (audioUri != null) {
+                audioPlayer.seekTo(audioStartMs)
+                audioPlayer.play()
+            }
             statusText = "वीडियो लोड हो गया!"
         }
+    }
+
+    val localAudioPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            audioUri = uri
+            audioTitle = "फोन का म्यूज़िक"
+            audioStartMs = 0L
+            audioPlayer.setMediaItem(MediaItem.fromUri(uri))
+            audioPlayer.prepare()
+            exoPlayer.volume = 0f
+            showMusicDialog = false
+            showMusicAdjust = true
+            statusText = "म्यूज़िक जुड़ गया!"
+        }
+    }
+
+    // WhatsApp-Style Music Search Dialog
+    if (showMusicDialog) {
+        AlertDialog(
+            onDismissRequest = { showMusicDialog = false },
+            containerColor = Color(0xFF1A1A20),
+            title = {
+                Text(
+                    text = "गाना सर्च करें",
+                    color = Color.White,
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                Column(modifier = Modifier.fillMaxWidth().heightIn(max = 400.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedTextField(
+                            value = searchQuery,
+                            onValueChange = { searchQuery = it },
+                            placeholder = { Text("जैसे: Tum Hi Ho, Arijit...", fontSize = 12.sp) },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White,
+                                focusedBorderColor = Color(0xFF2979FF)
+                            )
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        IconButton(
+                            onClick = {
+                                scope.launch {
+                                    isSearching = true
+                                    searchResults = searchOnlineSongs(searchQuery)
+                                    isSearching = false
+                                }
+                            },
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(Color(0xFF2979FF))
+                        ) {
+                            Icon(Icons.Default.Search, contentDescription = "Search", tint = Color.White)
+                        }
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+
+                    OutlinedButton(
+                        onClick = { localAudioPicker.launch(arrayOf("audio/*")) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.Folder, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("या फोन के स्टोरेज से गाना चुनें", fontSize = 12.sp)
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+
+                    if (isSearching || isDownloadingSong) {
+                        Box(
+                            modifier = Modifier.fillMaxWidth().padding(24.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                CircularProgressIndicator(color = Color(0xFF2979FF), modifier = Modifier.size(28.dp))
+                                Spacer(Modifier.height(8.dp))
+                                Text(
+                                    text = if (isDownloadingSong) "गाना लोड हो रहा है..." else "गाने खोज रहे हैं...",
+                                    color = Color.LightGray,
+                                    fontSize = 12.sp
+                                )
+                            }
+                        }
+                    } else if (searchResults.isEmpty() && searchQuery.isNotBlank()) {
+                        Text(
+                            text = "सर्च बटन (🔍) दबाएँ या दूसरा नाम लिखें",
+                            color = Color.Gray,
+                            fontSize = 12.sp,
+                            modifier = Modifier.padding(vertical = 12.dp)
+                        )
+                    } else {
+                        LazyColumn(modifier = Modifier.weight(1f, fill = false)) {
+                            items(searchResults) { song ->
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 4.dp)
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(Color(0xFF262630))
+                                        .clickable {
+                                            scope.launch {
+                                                isDownloadingSong = true
+                                                val cachedUri = downloadSongToCache(context, song)
+                                                isDownloadingSong = false
+                                                if (cachedUri != null) {
+                                                    audioUri = cachedUri
+                                                    audioTitle = song.title
+                                                    audioStartMs = 0L
+                                                    audioPlayer.setMediaItem(MediaItem.fromUri(cachedUri))
+                                                    audioPlayer.prepare()
+                                                    exoPlayer.volume = 0f
+                                                    showMusicDialog = false
+                                                    showMusicAdjust = true
+                                                    statusText = "गाना: ${song.title}"
+                                                } else {
+                                                    Toast.makeText(context, "गाना लोड नहीं हो सका", Toast.LENGTH_SHORT).show()
+                                                }
+                                            }
+                                        }
+                                        .padding(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(Icons.Default.MusicNote, contentDescription = null, tint = Color(0xFFFFD600))
+                                    Spacer(Modifier.width(8.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = song.title,
+                                            color = Color.White,
+                                            fontSize = 13.sp,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            text = song.artist,
+                                            color = Color.Gray,
+                                            fontSize = 11.sp,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("Use", color = Color(0xFF2979FF), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showMusicDialog = false }) {
+                    Text("Close", color = Color.LightGray)
+                }
+            }
+        )
     }
 
     Column(
@@ -225,12 +435,17 @@ fun MiniVNProApp() {
                         Toast.makeText(context, "पहले कोई वीडियो चुनें", Toast.LENGTH_SHORT).show()
                     } else if (!isExporting) {
                         exoPlayer.pause()
+                        audioPlayer.pause()
+                        isAudioPreviewing = false
                         isExporting = true
                         statusText = "HD MP4 बन रहा है..."
                         exportVideoClips(
                             context = context,
                             videoUri = uri,
                             clips = clips,
+                            audioUri = audioUri,
+                            audioStartMs = audioStartMs,
+                            audioDurationMs = audioDurationMs,
                             muteOriginal = isMuted,
                             onSuccess = {
                                 isExporting = false
@@ -323,13 +538,20 @@ fun MiniVNProApp() {
                 IconButton(
                     onClick = {
                         if (videoUri != null && clips.isNotEmpty()) {
+                            isAudioPreviewing = false
                             if (exoPlayer.isPlaying) {
                                 exoPlayer.pause()
+                                audioPlayer.pause()
                             } else {
                                 if (exoPlayer.playbackState == Player.STATE_ENDED) {
                                     seekToTotalPosition(0L)
                                 }
                                 exoPlayer.play()
+                                if (audioUri != null) {
+                                    val audioPos = (audioStartMs + getCurrentTotalPosition()).coerceAtMost(audioDurationMs)
+                                    audioPlayer.seekTo(audioPos)
+                                    audioPlayer.play()
+                                }
                             }
                         }
                     }
@@ -346,7 +568,8 @@ fun MiniVNProApp() {
                     text = statusText,
                     color = Color(0xFF8AB4F8),
                     fontSize = 11.sp,
-                    maxLines = 1
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
 
@@ -354,6 +577,8 @@ fun MiniVNProApp() {
                 value = currentTotalPosMs.toFloat().coerceIn(0f, totalDurationMs.toFloat()),
                 onValueChange = { newPos ->
                     exoPlayer.pause()
+                    audioPlayer.pause()
+                    isAudioPreviewing = false
                     seekToTotalPosition(newPos.toLong())
                 },
                 valueRange = 0f..totalDurationMs.toFloat(),
@@ -366,24 +591,142 @@ fun MiniVNProApp() {
             )
         }
 
-        // 4. VN-Style Video Clips Timeline
+        // 4. Music Start-Time Adjust Panel (WhatsApp Style)
+        if (showMusicAdjust && audioUri != null) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF1A221C))
+                    .padding(horizontal = 14.dp, vertical = 8.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "गाना शुरू होगा: ${formatTime(audioStartMs)} / ${formatTime(audioDurationMs)}",
+                        color = Color(0xFF81C784),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text(
+                            text = if (isAudioPreviewing) "रोकें" else "सुनें",
+                            color = Color(0xFFFFD600),
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.clickable {
+                                exoPlayer.pause()
+                                if (isAudioPreviewing) {
+                                    audioPlayer.pause()
+                                    isAudioPreviewing = false
+                                } else {
+                                    audioPlayer.seekTo(audioStartMs)
+                                    audioPlayer.play()
+                                    isAudioPreviewing = true
+                                }
+                            }
+                        )
+                        Text(
+                            text = "हटाएँ",
+                            color = Color(0xFFFF5252),
+                            fontSize = 12.sp,
+                            modifier = Modifier.clickable {
+                                audioPlayer.pause()
+                                audioPlayer.clearMediaItems()
+                                audioUri = null
+                                audioTitle = ""
+                                audioStartMs = 0L
+                                isAudioPreviewing = false
+                                showMusicAdjust = false
+                                exoPlayer.volume = if (isMuted) 0f else 1f
+                                statusText = "म्यूज़िक हटा दिया गया"
+                            }
+                        )
+                    }
+                }
+
+                val maxStart = (audioDurationMs - 1000L).coerceAtLeast(1000L).toFloat()
+                Slider(
+                    value = audioStartMs.toFloat().coerceIn(0f, maxStart),
+                    onValueChange = {
+                        audioStartMs = it.toLong()
+                        audioPlayer.seekTo(audioStartMs)
+                    },
+                    valueRange = 0f..maxStart,
+                    colors = SliderDefaults.colors(
+                        thumbColor = Color(0xFF4CAF50),
+                        activeTrackColor = Color(0xFF4CAF50),
+                        inactiveTrackColor = Color(0xFF3A4A3E)
+                    ),
+                    modifier = Modifier.height(28.dp)
+                )
+            }
+        }
+
+        // 5. VN-Style Timeline (Music Track + Video Clips)
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .background(Color(0xFF121215))
-                .padding(horizontal = 12.dp, vertical = 10.dp)
+                .padding(horizontal = 12.dp, vertical = 8.dp)
         ) {
-            Text(
-                text = "वीडियो को बीच में रोककर नीचे Split दबाएँ, फिर किसी क्लिप पर टैप करके Delete करें",
-                color = Color.Gray,
-                fontSize = 11.sp
-            )
-            Spacer(Modifier.height(8.dp))
-
+            // Music Track Bar
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(60.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color(0xFF222228))
+                    .clickable {
+                        if (audioUri != null) {
+                            showMusicAdjust = !showMusicAdjust
+                        } else {
+                            showMusicDialog = true
+                        }
+                    }
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(
+                        Icons.Default.MusicNote,
+                        contentDescription = null,
+                        tint = if (audioUri != null) Color(0xFF4CAF50) else Color.LightGray,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = if (audioUri != null) "$audioTitle (${formatTime(audioStartMs)})" else "Tap to search & add music",
+                        color = if (audioUri != null) Color(0xFF81C784) else Color.Gray,
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                if (audioUri != null) {
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = "बदलें",
+                        color = Color(0xFF2979FF),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.clickable { showMusicDialog = true }
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            // Video Clips Strip
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(58.dp)
                     .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -417,6 +760,7 @@ fun MiniVNProApp() {
                                 )
                                 .clickable {
                                     exoPlayer.pause()
+                                    audioPlayer.pause()
                                     selectedClipIndex = index
                                     exoPlayer.seekTo(index, 0L)
                                     currentTotalPosMs = getCurrentTotalPosition()
@@ -432,16 +776,25 @@ fun MiniVNProApp() {
             }
         }
 
-        // 5. VN-Style Bottom Toolbar
+        // 6. VN-Style Bottom Toolbar
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .background(Color(0xFF0E0E10))
-                .padding(vertical = 8.dp),
-            horizontalArrangement = Arrangement.SpaceEvenly
+                .horizontalScroll(rememberScrollState())
+                .padding(horizontal = 8.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             ToolButton(Icons.Default.VideoCall, "Video") {
                 videoPicker.launch(arrayOf("video/*"))
+            }
+
+            ToolButton(
+                icon = Icons.Default.MusicNote,
+                label = "Music",
+                tint = if (audioUri != null) Color(0xFF4CAF50) else Color.White
+            ) {
+                showMusicDialog = true
             }
 
             ToolButton(Icons.Default.ContentCut, "Split", tint = Color(0xFFFFD600)) {
@@ -453,6 +806,7 @@ fun MiniVNProApp() {
                     val splitPoint = clip.startMs + posInClip
                     if (splitPoint - clip.startMs >= 400L && clip.endMs - splitPoint >= 400L) {
                         exoPlayer.pause()
+                        audioPlayer.pause()
                         val leftClip = VideoClip(nextClipId++, clip.startMs, splitPoint)
                         val rightClip = VideoClip(nextClipId++, splitPoint, clip.endMs)
                         val updated = clips.toMutableList().apply {
@@ -474,6 +828,7 @@ fun MiniVNProApp() {
                 val uri = videoUri
                 if (uri != null && clips.size > 1 && selectedClipIndex in clips.indices) {
                     exoPlayer.pause()
+                    audioPlayer.pause()
                     val updated = clips.toMutableList().apply { removeAt(selectedClipIndex) }
                     clips = updated
                     val newIdx = selectedClipIndex.coerceAtMost(updated.lastIndex)
@@ -489,6 +844,7 @@ fun MiniVNProApp() {
                 val uri = videoUri
                 if (uri != null && selectedClipIndex in clips.indices) {
                     exoPlayer.pause()
+                    audioPlayer.pause()
                     val clip = clips[selectedClipIndex]
                     val copy = VideoClip(nextClipId++, clip.startMs, clip.endMs)
                     val updated = clips.toMutableList().apply { add(selectedClipIndex + 1, copy) }
@@ -504,7 +860,7 @@ fun MiniVNProApp() {
                 label = if (isMuted) "Muted" else "Sound"
             ) {
                 isMuted = !isMuted
-                exoPlayer.volume = if (isMuted) 0f else 1f
+                exoPlayer.volume = if (isMuted || audioUri != null) 0f else 1f
             }
         }
     }
@@ -542,11 +898,15 @@ fun exportVideoClips(
     context: Context,
     videoUri: Uri,
     clips: List<VideoClip>,
+    audioUri: Uri?,
+    audioStartMs: Long,
+    audioDurationMs: Long,
     muteOriginal: Boolean,
     onSuccess: () -> Unit,
     onError: (String) -> Unit
 ) {
     val tempFile = File(context.cacheDir, "MiniVNPro_${System.currentTimeMillis()}.mp4")
+    val totalDuration = clips.sumOf { it.durationMs }.coerceAtLeast(500L)
 
     val editedClips = clips.map { clip ->
         val mediaItem = MediaItem.Builder()
@@ -560,7 +920,7 @@ fun exportVideoClips(
             .build()
 
         EditedMediaItem.Builder(mediaItem)
-            .setRemoveAudio(muteOriginal)
+            .setRemoveAudio(muteOriginal || audioUri != null)
             .build()
     }
 
@@ -589,9 +949,31 @@ fun exportVideoClips(
         })
         .build()
 
-    val sequence = EditedMediaItemSequence(editedClips)
-    val composition = Composition.Builder(listOf(sequence)).build()
-    transformer.start(composition, tempFile.absolutePath)
+    val videoSequence = EditedMediaItemSequence(editedClips)
+
+    if (audioUri != null) {
+        val clipConfig = MediaItem.ClippingConfiguration.Builder()
+            .setStartPositionMs(audioStartMs)
+        if (audioDurationMs > 0 && audioStartMs + totalDuration < audioDurationMs) {
+            clipConfig.setEndPositionMs(audioStartMs + totalDuration)
+        }
+
+        val audioMediaItem = MediaItem.Builder()
+            .setUri(audioUri)
+            .setClippingConfiguration(clipConfig.build())
+            .build()
+
+        val editedAudio = EditedMediaItem.Builder(audioMediaItem)
+            .setRemoveVideo(true)
+            .build()
+
+        val audioSequence = EditedMediaItemSequence(listOf(editedAudio))
+        val composition = Composition.Builder(listOf(videoSequence, audioSequence)).build()
+        transformer.start(composition, tempFile.absolutePath)
+    } else {
+        val composition = Composition.Builder(listOf(videoSequence)).build()
+        transformer.start(composition, tempFile.absolutePath)
+    }
 }
 
 fun saveToGallery(context: Context, videoFile: File) {
