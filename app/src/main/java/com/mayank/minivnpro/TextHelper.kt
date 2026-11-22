@@ -10,7 +10,7 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.media3.common.Effect
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.effect.OverlayEffect
-import androidx.media3.effect.StaticOverlaySettings
+import androidx.media3.effect.OverlaySettings
 import androidx.media3.effect.TextOverlay
 import com.google.common.collect.ImmutableList
 
@@ -58,7 +58,7 @@ fun buildTextExportEffects(
         )
     }
 
-    val settings = StaticOverlaySettings.Builder()
+    val settings = OverlaySettings.Builder()
         .setBackgroundFrameAnchor(anchorX, anchorY)
         .setOverlayFrameAnchor(0f, 0f)
         .setScale(scale, scale)
