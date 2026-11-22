@@ -15,11 +15,13 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -30,9 +32,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -44,6 +50,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.transformer.Composition
 import androidx.media3.transformer.EditedMediaItem
 import androidx.media3.transformer.EditedMediaItemSequence
+import androidx.media3.transformer.Effects
 import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.Transformer
@@ -53,6 +60,7 @@ import kotlinx.coroutines.launch
 import java.io.File
 import java.io.FileInputStream
 import java.util.Locale
+import kotlin.math.roundToInt
 
 data class VideoClip(
     val id: Long,
@@ -99,6 +107,18 @@ fun MiniVNProApp() {
     var searchResults by remember { mutableStateOf<List<OnlineSong>>(emptyList()) }
     var isSearching by remember { mutableStateOf(false) }
     var isDownloadingSong by remember { mutableStateOf(false) }
+
+    // Draggable & Adjustable Text State
+    var overlayText by remember { mutableStateOf("") }
+    var textNormX by remember { mutableStateOf(0f) }
+    var textNormY by remember { mutableStateOf(0f) }
+    var textScale by remember { mutableStateOf(1.0f) }
+    var textColor by remember { mutableStateOf(Color.White) }
+    var textHasBg by remember { mutableStateOf(true) }
+    var previewSize by remember { mutableStateOf(IntSize.Zero) }
+    var showTextDialog by remember { mutableStateOf(false) }
+    var showTextAdjust by remember { mutableStateOf(false) }
+    var tempTextInput by remember { mutableStateOf("") }
 
     var isMuted by remember { mutableStateOf(false) }
     var currentTotalPosMs by remember { mutableStateOf(0L) }
@@ -246,9 +266,60 @@ fun MiniVNProApp() {
             audioPlayer.prepare()
             exoPlayer.volume = 0f
             showMusicDialog = false
+            showTextAdjust = false
             showMusicAdjust = true
             statusText = "म्यूज़िक जुड़ गया!"
         }
+    }
+
+    // Text Input Dialog
+    if (showTextDialog) {
+        AlertDialog(
+            onDismissRequest = { showTextDialog = false },
+            containerColor = Color(0xFF1A1A20),
+            title = {
+                Text(
+                    text = "वीडियो पर टेक्स्ट लिखें",
+                    color = Color.White,
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                OutlinedTextField(
+                    value = tempTextInput,
+                    onValueChange = { tempTextInput = it },
+                    placeholder = { Text("अपना नाम या शायरी लिखें...", fontSize = 13.sp) },
+                    singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = Color.White,
+                        unfocusedTextColor = Color.White,
+                        focusedBorderColor = Color(0xFF2979FF)
+                    )
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    overlayText = tempTextInput.trim()
+                    showTextDialog = false
+                    if (overlayText.isNotBlank()) {
+                        showMusicAdjust = false
+                        showTextAdjust = true
+                        statusText = "टेक्स्ट को उंगली से खींचकर सेट करें!"
+                    } else {
+                        showTextAdjust = false
+                        statusText = "टेक्स्ट हटा दिया गया"
+                    }
+                }) {
+                    Text("Save", color = Color(0xFF2979FF), fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showTextDialog = false }) {
+                    Text("Cancel", color = Color.Gray)
+                }
+            }
+        )
     }
 
     // WhatsApp-Style Music Search Dialog
@@ -353,6 +424,7 @@ fun MiniVNProApp() {
                                                     audioPlayer.prepare()
                                                     exoPlayer.volume = 0f
                                                     showMusicDialog = false
+                                                    showTextAdjust = false
                                                     showMusicAdjust = true
                                                     statusText = "गाना: ${song.title}"
                                                 } else {
@@ -447,6 +519,12 @@ fun MiniVNProApp() {
                             audioStartMs = audioStartMs,
                             audioDurationMs = audioDurationMs,
                             muteOriginal = isMuted,
+                            overlayText = overlayText,
+                            textAnchorX = textNormX,
+                            textAnchorY = -textNormY, // Invert Y for Media3 OpenGL coordinates
+                            textScale = textScale,
+                            textColor = textColor,
+                            textHasBg = textHasBg,
                             onSuccess = {
                                 isExporting = false
                                 statusText = "सेव हो गया! Movies/MiniVNPro"
@@ -470,12 +548,13 @@ fun MiniVNProApp() {
             }
         }
 
-        // 2. Video Preview Area
+        // 2. Video Preview Area + Draggable Text Overlay
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f)
-                .background(Color.Black),
+                .background(Color.Black)
+                .onSizeChanged { previewSize = it },
             contentAlignment = Alignment.Center
         ) {
             if (videoUri != null) {
@@ -498,6 +577,51 @@ fun MiniVNProApp() {
                     )
                     Spacer(Modifier.height(8.dp))
                     Text("कोई वीडियो नहीं चुना गया", color = Color.Gray, fontSize = 14.sp)
+                }
+            }
+
+            // Draggable Text
+            if (overlayText.isNotBlank()) {
+                val bgCol = when {
+                    !textHasBg -> Color.Transparent
+                    textColor == Color.Black -> Color(0xCCFFFFFF)
+                    else -> Color(0x99000000)
+                }
+                Box(
+                    modifier = Modifier
+                        .offset {
+                            IntOffset(
+                                (textNormX * previewSize.width / 2f).roundToInt(),
+                                (textNormY * previewSize.height / 2f).roundToInt()
+                            )
+                        }
+                        .pointerInput(previewSize) {
+                            detectDragGestures { change, dragAmount ->
+                                change.consume()
+                                if (previewSize.width > 0 && previewSize.height > 0) {
+                                    textNormX = (textNormX + (dragAmount.x / (previewSize.width / 2f))).coerceIn(-0.85f, 0.85f)
+                                    textNormY = (textNormY + (dragAmount.y / (previewSize.height / 2f))).coerceIn(-0.85f, 0.85f)
+                                }
+                            }
+                        }
+                        .clickable {
+                            showMusicAdjust = false
+                            showTextAdjust = true
+                        }
+                        .border(
+                            width = if (showTextAdjust) 1.dp else 0.dp,
+                            color = if (showTextAdjust) Color(0xAAFFD600) else Color.Transparent,
+                            shape = RoundedCornerShape(6.dp)
+                        )
+                        .background(bgCol, RoundedCornerShape(6.dp))
+                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                ) {
+                    Text(
+                        text = overlayText,
+                        color = textColor,
+                        fontSize = (18f * textScale).sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
                 }
             }
 
@@ -591,7 +715,95 @@ fun MiniVNProApp() {
             )
         }
 
-        // 4. Music Start-Time Adjust Panel (WhatsApp Style)
+        // 4A. Text Adjust Panel (Size, Color, Background, Edit, Delete)
+        if (showTextAdjust && overlayText.isNotBlank()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF1F1D15))
+                    .padding(horizontal = 14.dp, vertical = 8.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "टेक्स्ट एडजस्ट (उंगली से जगह बदलें)",
+                        color = Color(0xFFFFD600),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text(
+                            text = if (textHasBg) "Box: ON" else "Box: OFF",
+                            color = Color.LightGray,
+                            fontSize = 11.sp,
+                            modifier = Modifier.clickable { textHasBg = !textHasBg }
+                        )
+                        Text(
+                            text = "Edit",
+                            color = Color(0xFF2979FF),
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.clickable {
+                                tempTextInput = overlayText
+                                showTextDialog = true
+                            }
+                        )
+                        Text(
+                            text = "हटाएँ",
+                            color = Color(0xFFFF5252),
+                            fontSize = 11.sp,
+                            modifier = Modifier.clickable {
+                                overlayText = ""
+                                showTextAdjust = false
+                                statusText = "टेक्स्ट हटा दिया गया"
+                            }
+                        )
+                    }
+                }
+
+                // Size Slider
+                Slider(
+                    value = textScale,
+                    onValueChange = { textScale = it },
+                    valueRange = 0.6f..2.2f,
+                    colors = SliderDefaults.colors(
+                        thumbColor = Color(0xFFFFD600),
+                        activeTrackColor = Color(0xFFFFD600),
+                        inactiveTrackColor = Color(0xFF4A4635)
+                    ),
+                    modifier = Modifier.height(26.dp)
+                )
+
+                // Color Picker Dots
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("रंग:", color = Color.LightGray, fontSize = 11.sp)
+                    textColorPalette.forEach { col ->
+                        val selected = textColor == col
+                        Box(
+                            modifier = Modifier
+                                .size(24.dp)
+                                .clip(CircleShape)
+                                .background(col)
+                                .border(
+                                    width = if (selected) 2.5.dp else 1.dp,
+                                    color = if (selected) Color(0xFF2979FF) else Color.Gray,
+                                    shape = CircleShape
+                                )
+                                .clickable { textColor = col }
+                        )
+                    }
+                }
+            }
+        }
+
+        // 4B. Music Start-Time Adjust Panel
         if (showMusicAdjust && audioUri != null) {
             Column(
                 modifier = Modifier
@@ -665,7 +877,7 @@ fun MiniVNProApp() {
             }
         }
 
-        // 5. VN-Style Timeline (Music Track + Video Clips)
+        // 5. VN-Style Timeline (Music + Text + Video Clips)
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -680,12 +892,13 @@ fun MiniVNProApp() {
                     .background(Color(0xFF222228))
                     .clickable {
                         if (audioUri != null) {
+                            showTextAdjust = false
                             showMusicAdjust = !showMusicAdjust
                         } else {
                             showMusicDialog = true
                         }
                     }
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                    .padding(horizontal = 12.dp, vertical = 7.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
@@ -697,7 +910,7 @@ fun MiniVNProApp() {
                         Icons.Default.MusicNote,
                         contentDescription = null,
                         tint = if (audioUri != null) Color(0xFF4CAF50) else Color.LightGray,
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(17.dp)
                     )
                     Spacer(Modifier.width(8.dp))
                     Text(
@@ -720,13 +933,68 @@ fun MiniVNProApp() {
                 }
             }
 
+            Spacer(Modifier.height(6.dp))
+
+            // Text / Subtitle Track Bar
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color(0xFF222228))
+                    .clickable {
+                        if (overlayText.isNotBlank()) {
+                            showMusicAdjust = false
+                            showTextAdjust = !showTextAdjust
+                        } else {
+                            tempTextInput = ""
+                            showTextDialog = true
+                        }
+                    }
+                    .padding(horizontal = 12.dp, vertical = 7.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(
+                        Icons.Default.Title,
+                        contentDescription = null,
+                        tint = if (overlayText.isNotBlank()) Color(0xFFFFD600) else Color.LightGray,
+                        modifier = Modifier.size(17.dp)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = if (overlayText.isNotBlank()) "Text: $overlayText" else "Tap to add text / subtitle",
+                        color = if (overlayText.isNotBlank()) Color(0xFFFFD600) else Color.Gray,
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                if (overlayText.isNotBlank()) {
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = "Edit",
+                        color = Color(0xFF2979FF),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.clickable {
+                            tempTextInput = overlayText
+                            showTextDialog = true
+                        }
+                    )
+                }
+            }
+
             Spacer(Modifier.height(8.dp))
 
             // Video Clips Strip
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(58.dp)
+                    .height(54.dp)
                     .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -795,6 +1063,20 @@ fun MiniVNProApp() {
                 tint = if (audioUri != null) Color(0xFF4CAF50) else Color.White
             ) {
                 showMusicDialog = true
+            }
+
+            ToolButton(
+                icon = Icons.Default.Title,
+                label = "Text",
+                tint = if (overlayText.isNotBlank()) Color(0xFFFFD600) else Color.White
+            ) {
+                if (overlayText.isBlank()) {
+                    tempTextInput = ""
+                    showTextDialog = true
+                } else {
+                    showMusicAdjust = false
+                    showTextAdjust = !showTextAdjust
+                }
             }
 
             ToolButton(Icons.Default.ContentCut, "Split", tint = Color(0xFFFFD600)) {
@@ -902,11 +1184,26 @@ fun exportVideoClips(
     audioStartMs: Long,
     audioDurationMs: Long,
     muteOriginal: Boolean,
+    overlayText: String,
+    textAnchorX: Float,
+    textAnchorY: Float,
+    textScale: Float,
+    textColor: Color,
+    textHasBg: Boolean,
     onSuccess: () -> Unit,
     onError: (String) -> Unit
 ) {
     val tempFile = File(context.cacheDir, "MiniVNPro_${System.currentTimeMillis()}.mp4")
     val totalDuration = clips.sumOf { it.durationMs }.coerceAtLeast(500L)
+
+    val textEffects = buildTextExportEffects(
+        text = overlayText,
+        anchorX = textAnchorX,
+        anchorY = textAnchorY,
+        scale = textScale,
+        color = textColor,
+        hasBackground = textHasBg
+    )
 
     val editedClips = clips.map { clip ->
         val mediaItem = MediaItem.Builder()
@@ -919,9 +1216,13 @@ fun exportVideoClips(
             )
             .build()
 
-        EditedMediaItem.Builder(mediaItem)
+        val builder = EditedMediaItem.Builder(mediaItem)
             .setRemoveAudio(muteOriginal || audioUri != null)
-            .build()
+
+        if (textEffects.isNotEmpty()) {
+            builder.setEffects(Effects(emptyList(), textEffects))
+        }
+        builder.build()
     }
 
     val transformer = Transformer.Builder(context)
