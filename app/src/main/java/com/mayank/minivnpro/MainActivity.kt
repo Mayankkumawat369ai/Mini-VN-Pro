@@ -13,6 +13,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -31,12 +32,18 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
@@ -45,6 +52,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
@@ -56,8 +64,10 @@ import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.Transformer
 import androidx.media3.ui.PlayerView
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
 import java.util.Locale
@@ -93,9 +103,9 @@ fun VideoClip.toMediaItem(): MediaItem {
     }
 }
 
-fun getMediaDurationMs(context: Context, uri: Uri): Long {
+suspend fun getMediaDurationMsSafe(context: Context, uri: Uri): Long = withContext(Dispatchers.IO) {
     val retriever = MediaMetadataRetriever()
-    return try {
+    try {
         retriever.setDataSource(context, uri)
         retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 5000L
     } catch (e: Exception) {
@@ -147,28 +157,38 @@ fun MiniVNProApp() {
     var isSearching by remember { mutableStateOf(false) }
     var isDownloadingSong by remember { mutableStateOf(false) }
 
-    // Draggable & Adjustable Text State
+    // Upgraded Draggable Text State
     var overlayText by remember { mutableStateOf("") }
     var textNormX by remember { mutableStateOf(0f) }
     var textNormY by remember { mutableStateOf(0f) }
     var textScale by remember { mutableStateOf(1.0f) }
     var textColor by remember { mutableStateOf(Color.White) }
-    var textHasBg by remember { mutableStateOf(true) }
+    var textBgMode by remember { mutableStateOf(TextBgMode.DARK) }
+    var textFontStyle by remember { mutableStateOf(TextFontStyle.SANS) }
+    var textIsBold by remember { mutableStateOf(true) }
+    var textIsItalic by remember { mutableStateOf(false) }
     var previewSize by remember { mutableStateOf(IntSize.Zero) }
     var showTextDialog by remember { mutableStateOf(false) }
     var tempTextInput by remember { mutableStateOf("") }
 
-    // Filter, Color, Speed & Rotate State
+    // Upgraded Filter & Color Adjust State (Applied safely to prevent freeze)
     var selectedFilter by remember { mutableStateOf(VideoFilter.ORIGINAL) }
     var brightness by remember { mutableStateOf(0f) }
     var contrast by remember { mutableStateOf(0f) }
-    var playbackSpeed by remember { mutableStateOf(1.0f) }
+    var saturation by remember { mutableStateOf(0f) }
     var rotationDegrees by remember { mutableStateOf(0) }
+    var effectsVersion by remember { mutableStateOf(0) }
+
+    // VN-Style 5-Point Speed Curve State
+    var speedPoints by remember { mutableStateOf(listOf(1.0f, 1.0f, 1.0f, 1.0f, 1.0f)) }
+    var selectedSpeedPreset by remember { mutableStateOf("Normal") }
+    var liveSpeedDisplay by remember { mutableStateOf(1.0f) }
 
     var isMuted by remember { mutableStateOf(false) }
     var currentTotalPosMs by remember { mutableStateOf(0L) }
     var isPlaying by remember { mutableStateOf(false) }
     var isExporting by remember { mutableStateOf(false) }
+    var isLoadingMedia by remember { mutableStateOf(false) }
     var statusText by remember { mutableStateOf("नीचे +Video या +Photo पर टैप करें") }
 
     val totalDurationMs = remember(clips) {
@@ -178,26 +198,31 @@ fun MiniVNProApp() {
     val exoPlayer = remember { ExoPlayer.Builder(context).build() }
     val audioPlayer = remember { ExoPlayer.Builder(context).build() }
 
-    fun loadClipsIntoPlayer(
+    fun loadClipsSafely(
         clipList: List<VideoClip>,
         seekClipIdx: Int = 0,
         seekPosInClip: Long = 0L,
         autoPlay: Boolean = false
     ) {
-        if (clipList.isEmpty()) {
+        try {
+            exoPlayer.stop()
             exoPlayer.clearMediaItems()
-            return
+            if (clipList.isEmpty()) return
+
+            val mediaItems = clipList.map { it.toMediaItem() }
+            val safeIdx = seekClipIdx.coerceIn(0, clipList.lastIndex)
+            val safePos = seekPosInClip.coerceIn(0L, clipList[safeIdx].durationMs)
+
+            exoPlayer.setVideoEffects(
+                buildPreviewVideoEffects(selectedFilter, brightness, contrast, saturation, rotationDegrees)
+            )
+            exoPlayer.setMediaItems(mediaItems, safeIdx, safePos)
+            exoPlayer.prepare()
+            exoPlayer.volume = if (isMuted || audioUri != null) 0f else 1f
+            exoPlayer.playWhenReady = autoPlay
+        } catch (e: Exception) {
+            statusText = "प्लेयर रीसेट किया गया"
         }
-        val mediaItems = clipList.map { it.toMediaItem() }
-        val safeIdx = seekClipIdx.coerceIn(0, clipList.lastIndex)
-        exoPlayer.setVideoEffects(
-            buildPreviewVideoEffects(selectedFilter, brightness, contrast, rotationDegrees)
-        )
-        exoPlayer.setMediaItems(mediaItems, safeIdx, seekPosInClip)
-        exoPlayer.setPlaybackSpeed(playbackSpeed)
-        exoPlayer.prepare()
-        exoPlayer.volume = if (isMuted || audioUri != null) 0f else 1f
-        exoPlayer.playWhenReady = autoPlay
     }
 
     fun getCurrentTotalPosition(): Long {
@@ -219,7 +244,9 @@ fun MiniVNProApp() {
                 selectedClipIndex = i
                 currentTotalPosMs = targetMs
                 if (audioUri != null) {
-                    val audioOffset = (targetMs / playbackSpeed).toLong()
+                    val ratio = (targetMs.toFloat() / totalDurationMs.toFloat()).coerceIn(0f, 1f)
+                    val estTotal = estimateCurveDurationMs(totalDurationMs, speedPoints)
+                    val audioOffset = (ratio * estTotal).toLong()
                     audioPlayer.seekTo((audioStartMs + audioOffset).coerceAtMost(audioDurationMs))
                 }
                 return
@@ -243,6 +270,13 @@ fun MiniVNProApp() {
                     audioPlayer.pause()
                 }
             }
+
+            override fun onPlayerError(error: PlaybackException) {
+                // Auto-recover if ExoPlayer ever hits a codec/surface hiccup
+                exoPlayer.stop()
+                exoPlayer.prepare()
+                statusText = "प्लेयर ऑटो-रिकवर हो गया"
+            }
         }
         val audioListener = object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
@@ -264,59 +298,65 @@ fun MiniVNProApp() {
         }
     }
 
-    // Apply Filter / Brightness / Contrast / Rotate live on preview
-    LaunchedEffect(selectedFilter, brightness, contrast, rotationDegrees) {
-        if (clips.isEmpty()) return@LaunchedEffect
-        delay(150)
-        val idx = exoPlayer.currentMediaItemIndex
+    // Only reload ExoPlayer effects when user finishes adjusting (prevents freezing!)
+    LaunchedEffect(effectsVersion) {
+        if (effectsVersion == 0 || clips.isEmpty()) return@LaunchedEffect
+        val idx = exoPlayer.currentMediaItemIndex.coerceIn(0, clips.lastIndex)
         val pos = exoPlayer.currentPosition
         val wasPlaying = exoPlayer.isPlaying
-        exoPlayer.pause()
         audioPlayer.pause()
-        loadClipsIntoPlayer(clips, idx, pos, wasPlaying)
+        loadClipsSafely(clips, idx, pos, wasPlaying)
         if (wasPlaying && audioUri != null) {
-            val audioPos = (audioStartMs + (getCurrentTotalPosition() / playbackSpeed).toLong()).coerceAtMost(audioDurationMs)
-            audioPlayer.seekTo(audioPos)
             audioPlayer.play()
         }
     }
 
-    LaunchedEffect(playbackSpeed) {
-        exoPlayer.setPlaybackSpeed(playbackSpeed)
-    }
-
-    LaunchedEffect(isPlaying, clips) {
+    // Live VN Speed Curve playback loop (smooth, zero restarts!)
+    LaunchedEffect(isPlaying, clips, speedPoints) {
         while (isPlaying) {
-            currentTotalPosMs = getCurrentTotalPosition()
+            val pos = getCurrentTotalPosition()
+            currentTotalPosMs = pos
             val idx = exoPlayer.currentMediaItemIndex
             if (idx in clips.indices) selectedClipIndex = idx
-            delay(100)
+
+            val progress = (pos.toFloat() / totalDurationMs.toFloat()).coerceIn(0f, 1f)
+            val targetSpeed = getSpeedAtProgress(speedPoints, progress)
+            if (kotlin.math.abs(liveSpeedDisplay - targetSpeed) > 0.04f) {
+                liveSpeedDisplay = targetSpeed
+                exoPlayer.setPlaybackSpeed(targetSpeed)
+            }
+            delay(80)
         }
     }
 
-    // Multi-Video Picker (Can add 2, 3 or more videos at once!)
+    // Multi-Video Picker (Background IO thread - prevents UI freeze!)
     val multiVideoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
         if (uris.isNotEmpty()) {
-            val newClips = uris.map { uri ->
-                val dur = getMediaDurationMs(context, uri)
-                VideoClip(id = nextClipId++, uri = uri, startMs = 0L, endMs = dur, isImage = false)
+            scope.launch {
+                isLoadingMedia = true
+                statusText = "वीडियो लोड हो रहे हैं..."
+                val newClips = uris.map { uri ->
+                    val dur = getMediaDurationMsSafe(context, uri)
+                    VideoClip(id = nextClipId++, uri = uri, startMs = 0L, endMs = dur, isImage = false)
+                }
+                val startIdx = clips.size
+                val updated = clips + newClips
+                clips = updated
+                selectedClipIndex = startIdx.coerceIn(0, updated.lastIndex)
+                loadClipsSafely(updated, selectedClipIndex, 0L, true)
+                if (audioUri != null) {
+                    audioPlayer.seekTo(audioStartMs)
+                    audioPlayer.play()
+                }
+                isLoadingMedia = false
+                statusText = "${newClips.size} वीडियो क्लिप जुड़ गई!"
             }
-            val startIdx = clips.size
-            val updated = clips + newClips
-            clips = updated
-            selectedClipIndex = startIdx.coerceIn(0, updated.lastIndex)
-            loadClipsIntoPlayer(updated, selectedClipIndex, 0L, true)
-            if (audioUri != null) {
-                audioPlayer.seekTo(audioStartMs)
-                audioPlayer.play()
-            }
-            statusText = "${newClips.size} वीडियो क्लिप जुड़ गई!"
         }
     }
 
-    // Multi-Photo Picker (Adds photos as 4-second video clips)
+    // Multi-Photo Picker
     val multiPhotoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
@@ -328,7 +368,7 @@ fun MiniVNProApp() {
             val updated = clips + newClips
             clips = updated
             selectedClipIndex = startIdx.coerceIn(0, updated.lastIndex)
-            loadClipsIntoPlayer(updated, selectedClipIndex, 0L, true)
+            loadClipsSafely(updated, selectedClipIndex, 0L, true)
             if (audioUri != null) {
                 audioPlayer.seekTo(audioStartMs)
                 audioPlayer.play()
@@ -353,7 +393,7 @@ fun MiniVNProApp() {
         }
     }
 
-    // Text Input Dialog
+    // Multi-Line Text Input Dialog
     if (showTextDialog) {
         AlertDialog(
             onDismissRequest = { showTextDialog = false },
@@ -365,8 +405,9 @@ fun MiniVNProApp() {
                 OutlinedTextField(
                     value = tempTextInput,
                     onValueChange = { tempTextInput = it },
-                    placeholder = { Text("अपना नाम या शायरी लिखें...", fontSize = 13.sp) },
-                    singleLine = true,
+                    placeholder = { Text("एक या ज़्यादा लाइन में लिखें...", fontSize = 13.sp) },
+                    minLines = 2,
+                    maxLines = 4,
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedTextColor = Color.White,
                         unfocusedTextColor = Color.White,
@@ -451,10 +492,7 @@ fun MiniVNProApp() {
                     Spacer(Modifier.height(8.dp))
 
                     if (isSearching || isDownloadingSong) {
-                        Box(
-                            modifier = Modifier.fillMaxWidth().padding(24.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
+                        Box(modifier = Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 CircularProgressIndicator(color = Color(0xFF2979FF), modifier = Modifier.size(28.dp))
                                 Spacer(Modifier.height(8.dp))
@@ -507,20 +545,8 @@ fun MiniVNProApp() {
                                     Icon(Icons.Default.MusicNote, contentDescription = null, tint = Color(0xFFFFD600))
                                     Spacer(Modifier.width(8.dp))
                                     Column(modifier = Modifier.weight(1f)) {
-                                        Text(
-                                            text = song.title,
-                                            color = Color.White,
-                                            fontSize = 13.sp,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
-                                        Text(
-                                            text = song.artist,
-                                            color = Color.Gray,
-                                            fontSize = 11.sp,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
+                                        Text(song.title, color = Color.White, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        Text(song.artist, color = Color.Gray, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                     }
                                     Spacer(Modifier.width(6.dp))
                                     Text("Use", color = Color(0xFF2979FF), fontSize = 12.sp, fontWeight = FontWeight.Bold)
@@ -556,7 +582,9 @@ fun MiniVNProApp() {
             Text("Mini VN Pro", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
 
             Text(
-                text = if (playbackSpeed != 1.0f) "${playbackSpeed}x" else if (clips.isEmpty()) "Original" else "${clips.size} Clip${if (clips.size > 1) "s" else ""}",
+                text = if (!isDefaultSpeedCurve(speedPoints)) "Curve ${String.format(Locale.US, "%.1fx", liveSpeedDisplay)}"
+                else if (clips.isEmpty()) "Original"
+                else "${clips.size} Clip${if (clips.size > 1) "s" else ""}",
                 color = Color(0xFFFFD600),
                 fontSize = 12.sp,
                 modifier = Modifier
@@ -584,14 +612,18 @@ fun MiniVNProApp() {
                             filter = selectedFilter,
                             brightness = brightness,
                             contrast = contrast,
+                            saturation = saturation,
                             rotationDegrees = rotationDegrees,
-                            speed = playbackSpeed,
+                            speedPoints = speedPoints,
                             overlayText = overlayText,
                             textAnchorX = textNormX,
                             textAnchorY = -textNormY,
                             textScale = textScale,
                             textColor = textColor,
-                            textHasBg = textHasBg,
+                            textBgMode = textBgMode,
+                            textFontStyle = textFontStyle,
+                            textIsBold = textIsBold,
+                            textIsItalic = textIsItalic,
                             onSuccess = {
                                 isExporting = false
                                 statusText = "सेव हो गया! Movies/MiniVNPro"
@@ -615,7 +647,7 @@ fun MiniVNProApp() {
             }
         }
 
-        // 2. Video Preview Area + Draggable Text Overlay
+        // 2. Video Preview Area + Draggable Upgraded Text Overlay
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -643,11 +675,6 @@ fun MiniVNProApp() {
             }
 
             if (overlayText.isNotBlank()) {
-                val bgCol = when {
-                    !textHasBg -> Color.Transparent
-                    textColor == Color.Black -> Color(0xCCFFFFFF)
-                    else -> Color(0x99000000)
-                }
                 Box(
                     modifier = Modifier
                         .offset {
@@ -671,19 +698,22 @@ fun MiniVNProApp() {
                             color = if (activePanel == "TEXT") Color(0xAAFFD600) else Color.Transparent,
                             shape = RoundedCornerShape(6.dp)
                         )
-                        .background(bgCol, RoundedCornerShape(6.dp))
+                        .background(getTextBgColor(textBgMode), RoundedCornerShape(6.dp))
                         .padding(horizontal = 12.dp, vertical = 6.dp)
                 ) {
                     Text(
                         text = overlayText,
                         color = textColor,
                         fontSize = (18f * textScale).sp,
-                        fontWeight = FontWeight.SemiBold
+                        fontFamily = textFontStyle.composeFamily,
+                        fontWeight = if (textIsBold) FontWeight.Bold else FontWeight.Normal,
+                        fontStyle = if (textIsItalic) FontStyle.Italic else FontStyle.Normal,
+                        textAlign = TextAlign.Center
                     )
                 }
             }
 
-            if (isExporting) {
+            if (isExporting || isLoadingMedia) {
                 Box(
                     modifier = Modifier.fillMaxSize().background(Color(0xAA000000)),
                     contentAlignment = Alignment.Center
@@ -691,7 +721,11 @@ fun MiniVNProApp() {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         CircularProgressIndicator(color = Color(0xFF2979FF))
                         Spacer(Modifier.height(10.dp))
-                        Text("MP4 वीडियो Export हो रहा है...", color = Color.White, fontSize = 14.sp)
+                        Text(
+                            text = if (isExporting) "MP4 वीडियो Export हो रहा है..." else "मीडिया लोड हो रहा है...",
+                            color = Color.White,
+                            fontSize = 14.sp
+                        )
                     }
                 }
             }
@@ -726,9 +760,14 @@ fun MiniVNProApp() {
                                 if (exoPlayer.playbackState == Player.STATE_ENDED) {
                                     seekToTotalPosition(0L)
                                 }
+                                val startProgress = (getCurrentTotalPosition().toFloat() / totalDurationMs.toFloat()).coerceIn(0f, 1f)
+                                val sp = getSpeedAtProgress(speedPoints, startProgress)
+                                liveSpeedDisplay = sp
+                                exoPlayer.setPlaybackSpeed(sp)
                                 exoPlayer.play()
                                 if (audioUri != null) {
-                                    val audioOffset = (getCurrentTotalPosition() / playbackSpeed).toLong()
+                                    val estTotal = estimateCurveDurationMs(totalDurationMs, speedPoints)
+                                    val audioOffset = (startProgress * estTotal).toLong()
                                     audioPlayer.seekTo((audioStartMs + audioOffset).coerceAtMost(audioDurationMs))
                                     audioPlayer.play()
                                 }
@@ -771,45 +810,166 @@ fun MiniVNProApp() {
             )
         }
 
-        // 4A. Speed Panel
+        // 4A. VN-Style Speed Curve Panel (Graph + Presets + 5 Editable Points)
         if (activePanel == "SPEED") {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(Color(0xFF1A1A22))
-                    .padding(horizontal = 14.dp, vertical = 10.dp)
+                    .background(Color(0xFF181820))
+                    .padding(horizontal = 12.dp, vertical = 8.dp)
             ) {
-                Text("वीडियो स्पीड (Slow-Mo / Fast)", color = Color(0xFFFFD600), fontSize = 11.sp, fontWeight = FontWeight.Medium)
-                Spacer(Modifier.height(8.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceEvenly
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    speedOptions.forEach { sp ->
-                        val selected = playbackSpeed == sp
+                    Text("VN Speed Curve (शुरू → बीच → अंत)", color = Color(0xFFFFD600), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    Text(
+                        text = "Reset",
+                        color = Color(0xFF2979FF),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.clickable {
+                            speedPoints = listOf(1.0f, 1.0f, 1.0f, 1.0f, 1.0f)
+                            selectedSpeedPreset = "Normal"
+                            liveSpeedDisplay = 1.0f
+                            exoPlayer.setPlaybackSpeed(1.0f)
+                            statusText = "Speed Curve रीसेट"
+                        }
+                    )
+                }
+
+                Spacer(Modifier.height(6.dp))
+
+                // Presets Row
+                Row(
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    speedCurvePresets.forEach { preset ->
+                        val isSel = selectedSpeedPreset == preset.name
                         Box(
                             modifier = Modifier
                                 .clip(RoundedCornerShape(8.dp))
-                                .background(if (selected) Color(0xFF2979FF) else Color(0xFF2A2A34))
+                                .background(if (isSel) Color(0xFF2979FF) else Color(0xFF2A2A35))
                                 .clickable {
-                                    playbackSpeed = sp
-                                    statusText = "Speed: ${sp}x"
+                                    speedPoints = preset.points
+                                    selectedSpeedPreset = preset.name
+                                    statusText = "Speed Curve: ${preset.name}"
                                 }
-                                .padding(horizontal = 14.dp, vertical = 8.dp)
+                                .padding(horizontal = 10.dp, vertical = 5.dp)
                         ) {
+                            Text(preset.name, color = Color.White, fontSize = 11.sp, fontWeight = if (isSel) FontWeight.Bold else FontWeight.Normal)
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(8.dp))
+
+                // Live VN Curve Graph
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(54.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(Color(0xFF101016))
+                        .border(1.dp, Color(0xFF30303E), RoundedCornerShape(8.dp))
+                        .padding(horizontal = 14.dp, vertical = 8.dp)
+                ) {
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        val w = size.width
+                        val h = size.height
+                        // 1.0x reference line
+                        val yNormal = h * (1f - ((1.0f - 0.3f) / 2.2f))
+                        drawLine(
+                            color = Color(0xFF3A3A48),
+                            start = Offset(0f, yNormal),
+                            end = Offset(w, yNormal),
+                            strokeWidth = 2f
+                        )
+
+                        val path = Path()
+                        val coords = speedPoints.mapIndexed { i, sp ->
+                            val x = (i.toFloat() / (speedPoints.size - 1)) * w
+                            val normY = ((sp - 0.3f) / 2.2f).coerceIn(0f, 1f)
+                            val y = h * (1f - normY)
+                            Offset(x, y)
+                        }
+                        coords.forEachIndexed { i, pt ->
+                            if (i == 0) path.moveTo(pt.x, pt.y) else path.lineTo(pt.x, pt.y)
+                        }
+                        drawPath(path, color = Color(0xFFFFD600), style = Stroke(width = 5f, cap = StrokeCap.Round))
+                        coords.forEach { pt ->
+                            drawCircle(color = Color(0xFF2979FF), radius = 8f, center = pt)
+                            drawCircle(color = Color.White, radius = 4f, center = pt)
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(6.dp))
+
+                // 5 Point Speed Controls (Start, 25%, Mid, 75%, End)
+                val labels = listOf("Start", "25%", "Mid", "75%", "End")
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    speedPoints.forEachIndexed { idx, sp ->
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(Color(0xFF24242E))
+                                .padding(horizontal = 6.dp, vertical = 4.dp)
+                        ) {
+                            Text(labels[idx], color = Color.Gray, fontSize = 9.sp)
                             Text(
-                                text = "${sp}x",
-                                color = Color.White,
-                                fontSize = 12.sp,
-                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
+                                text = String.format(Locale.US, "%.1fx", sp),
+                                color = Color(0xFFFFD600),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
                             )
+                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Text(
+                                    text = "−",
+                                    color = Color.White,
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier
+                                        .clip(CircleShape)
+                                        .background(Color(0xFF383846))
+                                        .clickable {
+                                            val updated = speedPoints.toMutableList()
+                                            updated[idx] = (sp - 0.2f).coerceAtLeast(0.3f)
+                                            speedPoints = updated
+                                            selectedSpeedPreset = "Custom"
+                                        }
+                                        .padding(horizontal = 6.dp)
+                                )
+                                Text(
+                                    text = "+",
+                                    color = Color.White,
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier
+                                        .clip(CircleShape)
+                                        .background(Color(0xFF2979FF))
+                                        .clickable {
+                                            val updated = speedPoints.toMutableList()
+                                            updated[idx] = (sp + 0.2f).coerceAtMost(2.5f)
+                                            speedPoints = updated
+                                            selectedSpeedPreset = "Custom"
+                                        }
+                                        .padding(horizontal = 6.dp)
+                                )
+                            }
                         }
                     }
                 }
             }
         }
 
-        // 4B. Filter & Color Adjust Panel
+        // 4B. Upgraded VN Filter & Color Adjust Panel (Applies on release -> Zero Freeze!)
         if (activePanel == "FILTER") {
             Column(
                 modifier = Modifier
@@ -822,7 +982,7 @@ fun MiniVNProApp() {
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Text("VN Filters & Color Adjust", color = Color(0xFFFFD600), fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                    Text("VN Filters & Color (स्लाइडर छोड़ते ही लागू होगा)", color = Color(0xFFFFD600), fontSize = 11.sp, fontWeight = FontWeight.Medium)
                     Text(
                         text = "Reset",
                         color = Color(0xFF2979FF),
@@ -832,6 +992,8 @@ fun MiniVNProApp() {
                             selectedFilter = VideoFilter.ORIGINAL
                             brightness = 0f
                             contrast = 0f
+                            saturation = 0f
+                            effectsVersion++
                             statusText = "Filter रीसेट हो गया"
                         }
                     )
@@ -851,6 +1013,7 @@ fun MiniVNProApp() {
                                 .background(if (isSelected) Color(0xFF2979FF) else Color(0xFF2A2A34))
                                 .clickable {
                                     selectedFilter = filter
+                                    effectsVersion++
                                     statusText = "Filter: ${filter.title}"
                                 }
                                 .padding(horizontal = 12.dp, vertical = 6.dp)
@@ -863,10 +1026,11 @@ fun MiniVNProApp() {
                 Spacer(Modifier.height(6.dp))
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Bright", color = Color.LightGray, fontSize = 11.sp, modifier = Modifier.width(48.dp))
+                    Text("Bright", color = Color.LightGray, fontSize = 11.sp, modifier = Modifier.width(54.dp))
                     Slider(
                         value = brightness,
                         onValueChange = { brightness = it },
+                        onValueChangeFinished = { effectsVersion++ },
                         valueRange = -0.5f..0.5f,
                         colors = SliderDefaults.colors(thumbColor = Color(0xFFFFD600), activeTrackColor = Color(0xFFFFD600)),
                         modifier = Modifier.weight(1f).height(24.dp)
@@ -874,39 +1038,46 @@ fun MiniVNProApp() {
                 }
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Contrast", color = Color.LightGray, fontSize = 11.sp, modifier = Modifier.width(48.dp))
+                    Text("Contrast", color = Color.LightGray, fontSize = 11.sp, modifier = Modifier.width(54.dp))
                     Slider(
                         value = contrast,
                         onValueChange = { contrast = it },
+                        onValueChangeFinished = { effectsVersion++ },
                         valueRange = -0.5f..0.5f,
                         colors = SliderDefaults.colors(thumbColor = Color(0xFF40C4FF), activeTrackColor = Color(0xFF40C4FF)),
+                        modifier = Modifier.weight(1f).height(24.dp)
+                    )
+                }
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Color+", color = Color.LightGray, fontSize = 11.sp, modifier = Modifier.width(54.dp))
+                    Slider(
+                        value = saturation,
+                        onValueChange = { saturation = it },
+                        onValueChangeFinished = { effectsVersion++ },
+                        valueRange = -80f..80f,
+                        colors = SliderDefaults.colors(thumbColor = Color(0xFFFF80AB), activeTrackColor = Color(0xFFFF80AB)),
                         modifier = Modifier.weight(1f).height(24.dp)
                     )
                 }
             }
         }
 
-        // 4C. Text Adjust Panel
+        // 4C. Upgraded Text Adjust Panel (Fonts, Bold/Italic, 4 Box Styles, 8 Colors, Size)
         if (activePanel == "TEXT" && overlayText.isNotBlank()) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(Color(0xFF1F1D15))
-                    .padding(horizontal = 14.dp, vertical = 8.dp)
+                    .padding(horizontal = 12.dp, vertical = 8.dp)
             ) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Text("टेक्स्ट एडजस्ट (उंगली से जगह बदलें)", color = Color(0xFFFFD600), fontSize = 11.sp, fontWeight = FontWeight.Medium)
-                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Text(
-                            text = if (textHasBg) "Box: ON" else "Box: OFF",
-                            color = Color.LightGray,
-                            fontSize = 11.sp,
-                            modifier = Modifier.clickable { textHasBg = !textHasBg }
-                        )
+                    Text("टेक्स्ट स्टाइल (उंगली से जगह बदलें)", color = Color(0xFFFFD600), fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         Text(
                             text = "Edit",
                             color = Color(0xFF2979FF),
@@ -930,17 +1101,71 @@ fun MiniVNProApp() {
                     }
                 }
 
+                Spacer(Modifier.height(6.dp))
+
+                // Font, Bold, Italic & Box Style Chips
+                Row(
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    TextFontStyle.values().forEach { style ->
+                        val sel = textFontStyle == style
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(if (sel) Color(0xFF2979FF) else Color(0xFF2D2B22))
+                                .clickable { textFontStyle = style }
+                                .padding(horizontal = 10.dp, vertical = 4.dp)
+                        ) {
+                            Text(style.label, color = Color.White, fontSize = 11.sp)
+                        }
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(if (textIsBold) Color(0xFFFFD600) else Color(0xFF2D2B22))
+                            .clickable { textIsBold = !textIsBold }
+                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Text("B", color = if (textIsBold) Color.Black else Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(if (textIsItalic) Color(0xFFFFD600) else Color(0xFF2D2B22))
+                            .clickable { textIsItalic = !textIsItalic }
+                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Text("I", color = if (textIsItalic) Color.Black else Color.White, fontSize = 11.sp, fontStyle = FontStyle.Italic)
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(Color(0xFF3A3628))
+                            .clickable {
+                                val all = TextBgMode.values()
+                                textBgMode = all[(textBgMode.ordinal + 1) % all.size]
+                            }
+                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Text(textBgMode.label, color = Color(0xFFFFD600), fontSize = 11.sp)
+                    }
+                }
+
                 Slider(
                     value = textScale,
                     onValueChange = { textScale = it },
                     valueRange = 0.6f..2.2f,
                     colors = SliderDefaults.colors(thumbColor = Color(0xFFFFD600), activeTrackColor = Color(0xFFFFD600)),
-                    modifier = Modifier.height(26.dp)
+                    modifier = Modifier.height(24.dp)
                 )
 
                 Row(
-                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    modifier = Modifier.fillMaxWidth().padding(top = 2.dp).horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text("रंग:", color = Color.LightGray, fontSize = 11.sp)
@@ -948,7 +1173,7 @@ fun MiniVNProApp() {
                         val selected = textColor == col
                         Box(
                             modifier = Modifier
-                                .size(24.dp)
+                                .size(22.dp)
                                 .clip(CircleShape)
                                 .background(col)
                                 .border(if (selected) 2.5.dp else 1.dp, if (selected) Color(0xFF2979FF) else Color.Gray, CircleShape)
@@ -1029,14 +1254,13 @@ fun MiniVNProApp() {
             }
         }
 
-        // 5. VN-Style Timeline (Music + Text + Multi-Clips)
+        // 5. VN-Style Timeline
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .background(Color(0xFF121215))
                 .padding(horizontal = 12.dp, vertical = 8.dp)
         ) {
-            // Music Track
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1072,7 +1296,6 @@ fun MiniVNProApp() {
 
             Spacer(Modifier.height(6.dp))
 
-            // Text Track
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1094,7 +1317,7 @@ fun MiniVNProApp() {
                     Icon(Icons.Default.Title, contentDescription = null, tint = if (overlayText.isNotBlank()) Color(0xFFFFD600) else Color.LightGray, modifier = Modifier.size(17.dp))
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        text = if (overlayText.isNotBlank()) "Text: $overlayText" else "Tap to add text / subtitle",
+                        text = if (overlayText.isNotBlank()) "Text: ${overlayText.replace("\n", " ")}" else "Tap to add text / subtitle",
                         color = if (overlayText.isNotBlank()) Color(0xFFFFD600) else Color.Gray,
                         fontSize = 12.sp,
                         maxLines = 1,
@@ -1112,11 +1335,10 @@ fun MiniVNProApp() {
 
             Spacer(Modifier.height(8.dp))
 
-            // Multi-Video & Photo Clips Strip
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(54.dp)
+                    .height(52.dp)
                     .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -1197,7 +1419,7 @@ fun MiniVNProApp() {
             ToolButton(
                 icon = Icons.Default.AutoAwesome,
                 label = "Filter",
-                tint = if (activePanel == "FILTER" || selectedFilter != VideoFilter.ORIGINAL || brightness != 0f || contrast != 0f) Color(0xFFFFD600) else Color.White
+                tint = if (activePanel == "FILTER" || selectedFilter != VideoFilter.ORIGINAL || brightness != 0f || contrast != 0f || saturation != 0f) Color(0xFFFFD600) else Color.White
             ) {
                 activePanel = if (activePanel == "FILTER") "NONE" else "FILTER"
             }
@@ -1205,7 +1427,7 @@ fun MiniVNProApp() {
             ToolButton(
                 icon = Icons.Default.Speed,
                 label = "Speed",
-                tint = if (activePanel == "SPEED" || playbackSpeed != 1.0f) Color(0xFFFFD600) else Color.White
+                tint = if (activePanel == "SPEED" || !isDefaultSpeedCurve(speedPoints)) Color(0xFFFFD600) else Color.White
             ) {
                 activePanel = if (activePanel == "SPEED") "NONE" else "SPEED"
             }
@@ -1216,6 +1438,7 @@ fun MiniVNProApp() {
                 tint = if (rotationDegrees % 360 != 0) Color(0xFFFFD600) else Color.White
             ) {
                 rotationDegrees = (rotationDegrees + 90) % 360
+                effectsVersion++
                 statusText = "Rotate: ${rotationDegrees}°"
             }
 
@@ -1258,7 +1481,7 @@ fun MiniVNProApp() {
                         }
                         clips = updated
                         selectedClipIndex = idx + 1
-                        loadClipsIntoPlayer(updated, idx + 1, 0L, false)
+                        loadClipsSafely(updated, idx + 1, 0L, false)
                         statusText = "क्लिप Split हो गई!"
                     } else {
                         Toast.makeText(context, "स्लाइडर को क्लिप के थोड़ा बीच में ले जाएँ", Toast.LENGTH_SHORT).show()
@@ -1275,12 +1498,13 @@ fun MiniVNProApp() {
                     if (updated.isEmpty()) {
                         selectedClipIndex = 0
                         currentTotalPosMs = 0L
+                        exoPlayer.stop()
                         exoPlayer.clearMediaItems()
                         statusText = "सारी क्लिप्स हट गईं"
                     } else {
                         val newIdx = selectedClipIndex.coerceAtMost(updated.lastIndex)
                         selectedClipIndex = newIdx
-                        loadClipsIntoPlayer(updated, newIdx, 0L, false)
+                        loadClipsSafely(updated, newIdx, 0L, false)
                         statusText = "क्लिप डिलीट हो गई!"
                     }
                 }
@@ -1295,7 +1519,7 @@ fun MiniVNProApp() {
                     val updated = clips.toMutableList().apply { add(selectedClipIndex + 1, copy) }
                     clips = updated
                     selectedClipIndex += 1
-                    loadClipsIntoPlayer(updated, selectedClipIndex, 0L, false)
+                    loadClipsSafely(updated, selectedClipIndex, 0L, false)
                     statusText = "क्लिप कॉपी हो गई!"
                 }
             }
@@ -1349,35 +1573,47 @@ fun exportVideoClips(
     filter: VideoFilter,
     brightness: Float,
     contrast: Float,
+    saturation: Float,
     rotationDegrees: Int,
-    speed: Float,
+    speedPoints: List<Float>,
     overlayText: String,
     textAnchorX: Float,
     textAnchorY: Float,
     textScale: Float,
     textColor: Color,
-    textHasBg: Boolean,
+    textBgMode: TextBgMode,
+    textFontStyle: TextFontStyle,
+    textIsBold: Boolean,
+    textIsItalic: Boolean,
     onSuccess: () -> Unit,
     onError: (String) -> Unit
 ) {
     val tempFile = File(context.cacheDir, "MiniVNPro_${System.currentTimeMillis()}.mp4")
     val rawDuration = clips.sumOf { it.durationMs }.coerceAtLeast(500L)
-    val effectiveDuration = (rawDuration / speed).toLong().coerceAtLeast(500L)
+    val effectiveDuration = estimateCurveDurationMs(rawDuration, speedPoints)
 
-    val baseVideoEffects = buildPreviewVideoEffects(filter, brightness, contrast, rotationDegrees) +
-        buildSpeedVideoEffects(speed) +
+    val commonVideoEffects = buildPreviewVideoEffects(filter, brightness, contrast, saturation, rotationDegrees) +
         buildTextExportEffects(
             text = overlayText,
             anchorX = textAnchorX,
             anchorY = textAnchorY,
             scale = textScale,
             color = textColor,
-            hasBackground = textHasBg
+            bgMode = textBgMode,
+            fontStyle = textFontStyle,
+            isBold = textIsBold,
+            isItalic = textIsItalic
         )
 
     val editedClips = clips.map { clip ->
         val removeClipAudio = clip.isImage || muteOriginal || audioUri != null
-        val audioProcessors = buildSpeedAudioProcessors(speed, removeClipAudio)
+        val (speedAudioFx, speedVideoFx) = if (clip.isImage) {
+            emptyList<androidx.media3.common.audio.AudioProcessor>() to emptyList()
+        } else {
+            buildSpeedCurveEffects(clip.durationMs, speedPoints, removeClipAudio)
+        }
+
+        val allVideoFx = commonVideoEffects + speedVideoFx
 
         val builder = EditedMediaItem.Builder(clip.toMediaItem())
             .setRemoveAudio(removeClipAudio)
@@ -1387,8 +1623,8 @@ fun exportVideoClips(
             builder.setFrameRate(30)
         }
 
-        if (baseVideoEffects.isNotEmpty() || audioProcessors.isNotEmpty()) {
-            builder.setEffects(Effects(audioProcessors, baseVideoEffects))
+        if (allVideoFx.isNotEmpty() || speedAudioFx.isNotEmpty()) {
+            builder.setEffects(Effects(speedAudioFx, allVideoFx))
         }
         builder.build()
     }
