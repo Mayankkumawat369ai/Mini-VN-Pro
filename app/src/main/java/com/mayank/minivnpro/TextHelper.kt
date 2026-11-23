@@ -3,9 +3,9 @@ package com.mayank.minivnpro
 import android.graphics.Typeface
 import android.text.Spannable
 import android.text.SpannableString
+import android.text.style.AbsoluteSizeSpan
 import android.text.style.BackgroundColorSpan
 import android.text.style.ForegroundColorSpan
-import android.text.style.RelativeSizeSpan
 import android.text.style.StyleSpan
 import android.text.style.TypefaceSpan
 import androidx.compose.ui.graphics.Color
@@ -91,13 +91,15 @@ fun buildTextExportEffects(
         }
         setSpan(StyleSpan(styleInt), 0, length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
         setSpan(TypefaceSpan(fontStyle.familyName), 0, length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
-        setSpan(RelativeSizeSpan(2.0f), 0, length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        // Fixed pixel size so exported text matches the preview instead of zooming huge
+        setSpan(AbsoluteSizeSpan(42, false), 0, length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
     }
 
+    val safeScale = (scale * 0.85f).coerceIn(0.4f, 1.8f)
     val settings = OverlaySettings.Builder()
-        .setBackgroundFrameAnchor(anchorX, anchorY)
+        .setBackgroundFrameAnchor(anchorX.coerceIn(-0.8f, 0.8f), anchorY.coerceIn(-0.8f, 0.8f))
         .setOverlayFrameAnchor(0f, 0f)
-        .setScale(scale, scale)
+        .setScale(safeScale, safeScale)
         .build()
 
     val textOverlay = TextOverlay.createStaticTextOverlay(spannable, settings)
