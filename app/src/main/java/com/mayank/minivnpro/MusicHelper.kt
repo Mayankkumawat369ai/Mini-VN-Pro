@@ -20,7 +20,7 @@ data class OnlineSong(
 suspend fun searchOnlineSongs(query: String): List<OnlineSong> = withContext(Dispatchers.IO) {
     if (query.isBlank()) return@withContext emptyList()
     val encoded = URLEncoder.encode(query.trim(), "UTF-8")
-    val urlStr = "https://itunes.apple.com/search?term=$encoded&media=music&entity=song&limit=15&country=IN"
+    val urlStr = "https://itunes.apple.com/search?term=$encoded&media=music&entity=song&limit=25&country=IN"
     val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
         requestMethod = "GET"
         connectTimeout = 8000
