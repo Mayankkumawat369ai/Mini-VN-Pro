@@ -1,6 +1,6 @@
 package com.mayank.minivnpro
 
-import androidx.compose.ui.graphics.Color
+import android.graphics.ColorMatrix
 import androidx.media3.common.C
 import androidx.media3.common.Effect
 import androidx.media3.common.audio.AudioProcessor
@@ -26,18 +26,92 @@ enum class VideoFilter(val title: String) {
     FADE("Fade")
 }
 
-fun getFilterPreviewTint(filter: VideoFilter): Color {
-    return when (filter) {
-        VideoFilter.ORIGINAL -> Color.Transparent
-        VideoFilter.BW -> Color(0x45808080)
-        VideoFilter.WARM -> Color(0x30FF9800)
-        VideoFilter.VINTAGE -> Color(0x38A1887F)
-        VideoFilter.COOL -> Color(0x3029B6F6)
-        VideoFilter.VIVID -> Color(0x20FF4081)
-        VideoFilter.CINEMATIC -> Color(0x35004D40)
-        VideoFilter.MOODY -> Color(0x401A237E)
-        VideoFilter.FADE -> Color(0x30ECEFF1)
+// Balanced ColorMatrix for Live Preview (Matches Export 1-to-1, Zero Freeze!)
+fun buildPreviewColorMatrix(
+    filter: VideoFilter,
+    brightness: Float,
+    contrast: Float,
+    saturation: Float
+): ColorMatrix {
+    val cm = ColorMatrix()
+
+    fun applyRgbScale(r: Float, g: Float, b: Float) {
+        cm.postConcat(
+            ColorMatrix(
+                floatArrayOf(
+                    r, 0f, 0f, 0f, 0f,
+                    0f, g, 0f, 0f, 0f,
+                    0f, 0f, b, 0f, 0f,
+                    0f, 0f, 0f, 1f, 0f
+                )
+            )
+        )
     }
+
+    fun applyContrast(cVal: Float) {
+        val c = (1f + cVal).coerceIn(0.55f, 1.55f)
+        val t = (-0.5f * c + 0.5f) * 255f
+        cm.postConcat(
+            ColorMatrix(
+                floatArrayOf(
+                    c, 0f, 0f, 0f, t,
+                    0f, c, 0f, 0f, t,
+                    0f, 0f, c, 0f, t,
+                    0f, 0f, 0f, 1f, 0f
+                )
+            )
+        )
+    }
+
+    fun applySaturation(satDelta: Float) {
+        val s = (1f + satDelta / 100f).coerceIn(0f, 1.8f)
+        cm.postConcat(ColorMatrix().apply { setSaturation(s) })
+    }
+
+    when (filter) {
+        VideoFilter.ORIGINAL -> {}
+        VideoFilter.BW -> cm.setSaturation(0f)
+        VideoFilter.WARM -> applyRgbScale(1.08f, 1.02f, 0.90f)
+        VideoFilter.VINTAGE -> {
+            applySaturation(-20f)
+            applyRgbScale(1.10f, 1.03f, 0.84f)
+        }
+        VideoFilter.COOL -> applyRgbScale(0.90f, 1.00f, 1.12f)
+        VideoFilter.VIVID -> {
+            applyContrast(0.14f)
+            applySaturation(22f)
+        }
+        VideoFilter.CINEMATIC -> {
+            applyContrast(0.16f)
+            applySaturation(-12f)
+            applyRgbScale(1.04f, 0.99f, 0.92f)
+        }
+        VideoFilter.MOODY -> {
+            applyContrast(0.18f)
+            applySaturation(-28f)
+            applyRgbScale(0.92f, 0.92f, 0.94f)
+        }
+        VideoFilter.FADE -> {
+            applyContrast(-0.14f)
+            applySaturation(-15f)
+            applyRgbScale(1.06f, 1.06f, 1.06f)
+        }
+    }
+
+    if (brightness != 0f) {
+        val b = (1f + brightness).coerceIn(0.6f, 1.45f)
+        applyRgbScale(b, b, b)
+    }
+
+    if (contrast != 0f) {
+        applyContrast(contrast.coerceIn(-0.35f, 0.35f))
+    }
+
+    if (saturation != 0f) {
+        applySaturation(saturation.coerceIn(-60f, 60f))
+    }
+
+    return cm
 }
 
 data class SpeedCurvePreset(
@@ -100,6 +174,7 @@ class CurveSpeedProvider(
     }
 }
 
+// Balanced Export Effects matching Preview ColorMatrix
 @UnstableApi
 fun buildExportVideoEffects(
     filter: VideoFilter,
@@ -115,55 +190,69 @@ fun buildExportVideoEffects(
         VideoFilter.BW -> effects.add(RgbFilter.createGrayscaleFilter())
         VideoFilter.WARM -> effects.add(
             RgbAdjustment.Builder()
-                .setRedScale(1.16f)
-                .setGreenScale(1.05f)
-                .setBlueScale(0.86f)
+                .setRedScale(1.08f)
+                .setGreenScale(1.02f)
+                .setBlueScale(0.90f)
                 .build()
         )
         VideoFilter.VINTAGE -> {
-            effects.add(HslAdjustment.Builder().adjustSaturation(-25f).build())
+            effects.add(HslAdjustment.Builder().adjustSaturation(-20f).build())
             effects.add(
                 RgbAdjustment.Builder()
-                    .setRedScale(1.18f)
-                    .setGreenScale(1.04f)
-                    .setBlueScale(0.76f)
+                    .setRedScale(1.10f)
+                    .setGreenScale(1.03f)
+                    .setBlueScale(0.84f)
                     .build()
             )
         }
         VideoFilter.COOL -> effects.add(
             RgbAdjustment.Builder()
-                .setRedScale(0.84f)
-                .setGreenScale(0.98f)
-                .setBlueScale(1.22f)
+                .setRedScale(0.90f)
+                .setGreenScale(1.00f)
+                .setBlueScale(1.12f)
                 .build()
         )
         VideoFilter.VIVID -> {
-            effects.add(Contrast(0.24f))
-            effects.add(HslAdjustment.Builder().adjustSaturation(35f).build())
+            effects.add(Contrast(0.14f))
+            effects.add(HslAdjustment.Builder().adjustSaturation(22f).build())
         }
         VideoFilter.CINEMATIC -> {
-            effects.add(Contrast(0.36f))
-            effects.add(HslAdjustment.Builder().adjustSaturation(-15f).build())
+            effects.add(Contrast(0.16f))
+            effects.add(HslAdjustment.Builder().adjustSaturation(-12f).build())
             effects.add(
                 RgbAdjustment.Builder()
-                    .setRedScale(1.08f)
-                    .setGreenScale(0.96f)
-                    .setBlueScale(0.88f)
+                    .setRedScale(1.04f)
+                    .setGreenScale(0.99f)
+                    .setBlueScale(0.92f)
                     .build()
             )
         }
         VideoFilter.MOODY -> {
-            effects.add(Contrast(0.32f))
-            effects.add(HslAdjustment.Builder().adjustSaturation(-35f).adjustLightness(-10f).build())
+            effects.add(Contrast(0.18f))
+            effects.add(HslAdjustment.Builder().adjustSaturation(-28f).build())
+            effects.add(
+                RgbAdjustment.Builder()
+                    .setRedScale(0.92f)
+                    .setGreenScale(0.92f)
+                    .setBlueScale(0.94f)
+                    .build()
+            )
         }
         VideoFilter.FADE -> {
-            effects.add(Contrast(-0.22f))
-            effects.add(HslAdjustment.Builder().adjustSaturation(-20f).adjustLightness(8f).build())
+            effects.add(Contrast(-0.14f))
+            effects.add(HslAdjustment.Builder().adjustSaturation(-15f).build())
+            effects.add(
+                RgbAdjustment.Builder()
+                    .setRedScale(1.06f)
+                    .setGreenScale(1.06f)
+                    .setBlueScale(1.06f)
+                    .build()
+            )
         }
     }
 
     if (brightness != 0f) {
-        val scale = (1f + brightness).coerceIn(0.35f, 1.75f)
+        val scale = (1f + brightness).coerceIn(0.6f, 1.45f)
         effects.add(
             RgbAdjustment.Builder()
                 .setRedScale(scale)
@@ -174,11 +263,11 @@ fun buildExportVideoEffects(
     }
 
     if (contrast != 0f) {
-        effects.add(Contrast(contrast.coerceIn(-0.65f, 0.65f)))
+        effects.add(Contrast(contrast.coerceIn(-0.35f, 0.35f)))
     }
 
     if (saturation != 0f) {
-        effects.add(HslAdjustment.Builder().adjustSaturation(saturation.coerceIn(-90f, 90f)).build())
+        effects.add(HslAdjustment.Builder().adjustSaturation(saturation.coerceIn(-60f, 60f)).build())
     }
 
     if (rotationDegrees % 360 != 0) {
