@@ -2,6 +2,8 @@ package com.mayank.minivnpro
 
 import android.content.ContentValues
 import android.content.Context
+import android.graphics.ColorMatrixColorFilter
+import android.graphics.Paint
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
@@ -177,7 +179,7 @@ fun MiniVNProApp() {
     var showTextDialog by remember { mutableStateOf(false) }
     var tempTextInput by remember { mutableStateOf("") }
 
-    // Filter, Color & Rotate State (Zero ExoPlayer restarts)
+    // Real GPU Filter, Color & Rotate State (Matches Export, Zero Freezes)
     var selectedFilter by remember { mutableStateOf(VideoFilter.ORIGINAL) }
     var brightness by remember { mutableStateOf(0f) }
     var contrast by remember { mutableStateOf(0f) }
@@ -201,6 +203,14 @@ fun MiniVNProApp() {
     }
 
     val currentClip = clips.getOrNull(selectedClipIndex)
+
+    val liveColorFilter = remember(selectedFilter, brightness, contrast, saturation) {
+        if (selectedFilter == VideoFilter.ORIGINAL && brightness == 0f && contrast == 0f && saturation == 0f) {
+            null
+        } else {
+            ColorMatrixColorFilter(buildPreviewColorMatrix(selectedFilter, brightness, contrast, saturation))
+        }
+    }
 
     val exoPlayer = remember { ExoPlayer.Builder(context).build() }
     val audioPlayer = remember { ExoPlayer.Builder(context).build() }
@@ -695,7 +705,7 @@ fun MiniVNProApp() {
             }
         }
 
-        // 2. Anti-Freeze Preview Area
+        // 2. Real GPU ColorMatrix Preview Area (Matches Export 1-to-1, Zero Freeze)
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -718,6 +728,14 @@ fun MiniVNProApp() {
                             exoPlayer.setVideoTextureView(tv)
                         }
                     },
+                    update = { tv ->
+                        if (liveColorFilter != null) {
+                            tv.setLayerPaint(Paint().apply { colorFilter = liveColorFilter })
+                        } else {
+                            tv.setLayerPaint(null)
+                        }
+                        tv.invalidate()
+                    },
                     modifier = Modifier
                         .fillMaxHeight()
                         .aspectRatio(videoAspectRatio.coerceIn(0.4f, 2.5f))
@@ -732,26 +750,11 @@ fun MiniVNProApp() {
                         },
                         update = { imgView ->
                             imgView.setImageURI(currentClip.uri)
+                            imgView.colorFilter = liveColorFilter
                         },
                         modifier = Modifier
                             .fillMaxSize()
                             .background(Color.Black)
-                    )
-                }
-
-                val filterTint = getFilterPreviewTint(selectedFilter)
-                if (clips.isNotEmpty() && (filterTint != Color.Transparent || brightness != 0f)) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(filterTint)
-                            .background(
-                                when {
-                                    brightness > 0f -> Color.White.copy(alpha = (brightness * 0.45f).coerceIn(0f, 0.35f))
-                                    brightness < 0f -> Color.Black.copy(alpha = (-brightness * 0.65f).coerceIn(0f, 0.5f))
-                                    else -> Color.Transparent
-                                }
-                            )
                     )
                 }
             }
@@ -1074,7 +1077,7 @@ fun MiniVNProApp() {
             }
         }
 
-        // 4B. Filter & Color Adjust Panel
+        // 4B. Real-Time Balanced Filter & Color Adjust Panel
         if (activePanel == "FILTER") {
             Column(
                 modifier = Modifier
@@ -1087,7 +1090,7 @@ fun MiniVNProApp() {
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Text("VN Filters & Color (Export में असली HD लागू होगा)", color = Color(0xFFFFD600), fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                    Text("VN Filters & Color (स्क्रीन जैसा ही Export होगा)", color = Color(0xFFFFD600), fontSize = 11.sp, fontWeight = FontWeight.Medium)
                     Text(
                         text = "Reset",
                         color = Color(0xFF2979FF),
@@ -1133,7 +1136,7 @@ fun MiniVNProApp() {
                     Slider(
                         value = brightness,
                         onValueChange = { brightness = it },
-                        valueRange = -0.5f..0.5f,
+                        valueRange = -0.35f..0.35f,
                         colors = SliderDefaults.colors(thumbColor = Color(0xFFFFD600), activeTrackColor = Color(0xFFFFD600)),
                         modifier = Modifier.weight(1f).height(24.dp)
                     )
@@ -1144,7 +1147,7 @@ fun MiniVNProApp() {
                     Slider(
                         value = contrast,
                         onValueChange = { contrast = it },
-                        valueRange = -0.5f..0.5f,
+                        valueRange = -0.35f..0.35f,
                         colors = SliderDefaults.colors(thumbColor = Color(0xFF40C4FF), activeTrackColor = Color(0xFF40C4FF)),
                         modifier = Modifier.weight(1f).height(24.dp)
                     )
@@ -1155,7 +1158,7 @@ fun MiniVNProApp() {
                     Slider(
                         value = saturation,
                         onValueChange = { saturation = it },
-                        valueRange = -80f..80f,
+                        valueRange = -60f..60f,
                         colors = SliderDefaults.colors(thumbColor = Color(0xFFFF80AB), activeTrackColor = Color(0xFFFF80AB)),
                         modifier = Modifier.weight(1f).height(24.dp)
                     )
