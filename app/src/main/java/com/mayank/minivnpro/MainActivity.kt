@@ -4,6 +4,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
+import android.media.MediaCodecInfo
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
@@ -63,14 +64,17 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.effect.Presentation
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.transformer.Composition
+import androidx.media3.transformer.DefaultEncoderFactory
 import androidx.media3.transformer.EditedMediaItem
 import androidx.media3.transformer.EditedMediaItemSequence
 import androidx.media3.transformer.Effects
 import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.Transformer
+import androidx.media3.transformer.VideoEncoderSettings
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -179,7 +183,7 @@ fun MiniVNProApp() {
     var showTextDialog by remember { mutableStateOf(false) }
     var tempTextInput by remember { mutableStateOf("") }
 
-    // Real GPU Filter, Color & Rotate State (Matches Export, Zero Freezes)
+    // Filter, Color & Rotate State
     var selectedFilter by remember { mutableStateOf(VideoFilter.ORIGINAL) }
     var brightness by remember { mutableStateOf(0f) }
     var contrast by remember { mutableStateOf(0f) }
@@ -641,8 +645,8 @@ fun MiniVNProApp() {
 
             Text(
                 text = if (!isDefaultSpeedCurve(speedPoints)) "Curve ${String.format(Locale.US, "%.1fx", liveSpeedDisplay)}"
-                else if (clips.isEmpty()) "Original"
-                else "${clips.size} Clip${if (clips.size > 1) "s" else ""}",
+                else if (clips.isEmpty()) "1080p HD"
+                else "${clips.size} Clip${if (clips.size > 1) "s" else ""} • 1080p",
                 color = Color(0xFFFFD600),
                 fontSize = 12.sp,
                 modifier = Modifier
@@ -659,7 +663,7 @@ fun MiniVNProApp() {
                         audioPlayer.pause()
                         isAudioPreviewing = false
                         isExporting = true
-                        statusText = "HD MP4 बन रहा है..."
+                        statusText = "1080p Full HD बन रहा है..."
                         exportVideoClips(
                             context = context,
                             clips = clips,
@@ -682,10 +686,10 @@ fun MiniVNProApp() {
                             textFontStyle = textFontStyle,
                             textIsBold = textIsBold,
                             textIsItalic = textIsItalic,
-                            onSuccess = {
+                            onSuccess = { resInfo ->
                                 isExporting = false
-                                statusText = "सेव हो गया! Movies/MiniVNPro"
-                                Toast.makeText(context, "वीडियो गैलरी में सेव हो गया!", Toast.LENGTH_LONG).show()
+                                statusText = "सेव: $resInfo"
+                                Toast.makeText(context, "वीडियो सेव हो गया ($resInfo)!", Toast.LENGTH_LONG).show()
                             },
                             onError = { err ->
                                 isExporting = false
@@ -705,7 +709,7 @@ fun MiniVNProApp() {
             }
         }
 
-        // 2. Real GPU ColorMatrix Preview Area (Matches Export 1-to-1, Zero Freeze)
+        // 2. Real GPU ColorMatrix Preview Area
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -815,7 +819,7 @@ fun MiniVNProApp() {
                         CircularProgressIndicator(color = Color(0xFF2979FF))
                         Spacer(Modifier.height(10.dp))
                         Text(
-                            text = if (isExporting) "MP4 वीडियो Export हो रहा है..." else "मीडिया लोड हो रहा है...",
+                            text = if (isExporting) "1080p Full HD (20 Mbps) बन रहा है..." else "मीडिया लोड हो रहा है...",
                             color = Color.White,
                             fontSize = 14.sp
                         )
@@ -1090,7 +1094,7 @@ fun MiniVNProApp() {
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Text("VN Filters & Color (स्क्रीन जैसा ही Export होगा)", color = Color(0xFFFFD600), fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                    Text("VN Filters & Color (100% Exact Export)", color = Color(0xFFFFD600), fontSize = 11.sp, fontWeight = FontWeight.Medium)
                     Text(
                         text = "Reset",
                         color = Color(0xFF2979FF),
@@ -1720,14 +1724,16 @@ fun exportVideoClips(
     textFontStyle: TextFontStyle,
     textIsBold: Boolean,
     textIsItalic: Boolean,
-    onSuccess: () -> Unit,
+    onSuccess: (String) -> Unit,
     onError: (String) -> Unit
 ) {
     val tempFile = File(context.cacheDir, "MiniVNPro_${System.currentTimeMillis()}.mp4")
     val rawDuration = clips.sumOf { it.durationMs }.coerceAtLeast(500L)
     val effectiveDuration = estimateCurveDurationMs(rawDuration, speedPoints)
 
+    // Presentation(1080) placed BEFORE TextOverlay so video & text both render crisp at Full HD
     val commonVideoEffects = buildExportVideoEffects(filter, brightness, contrast, saturation, rotationDegrees) +
+        listOf(Presentation.createForShortSide(1080)) +
         buildTextExportEffects(
             text = overlayText,
             anchorX = textAnchorX,
@@ -1764,15 +1770,31 @@ fun exportVideoClips(
         builder.build()
     }
 
+    // 20 Mbps VBR Full HD Encoder for crisp VN-level clarity
+    val encoderFactory = DefaultEncoderFactory.Builder(context)
+        .setRequestedVideoEncoderSettings(
+            VideoEncoderSettings.Builder()
+                .setBitrate(20_000_000)
+                .setBitrateMode(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+                .build()
+        )
+        .build()
+
     val transformer = Transformer.Builder(context)
         .setVideoMimeType(MimeTypes.VIDEO_H264)
         .setAudioMimeType(MimeTypes.AUDIO_AAC)
+        .setEncoderFactory(encoderFactory)
         .addListener(object : Transformer.Listener {
             override fun onCompleted(composition: Composition, exportResult: ExportResult) {
                 try {
                     saveToGallery(context, tempFile)
                     tempFile.delete()
-                    onSuccess()
+                    val resInfo = if (exportResult.width > 0 && exportResult.height > 0) {
+                        "${exportResult.width}x${exportResult.height} Full HD"
+                    } else {
+                        "1080p Full HD"
+                    }
+                    onSuccess(resInfo)
                 } catch (e: Exception) {
                     onError(e.message ?: "Save failed")
                 }
