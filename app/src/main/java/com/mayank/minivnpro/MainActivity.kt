@@ -667,6 +667,7 @@ fun MiniVNProApp() {
                         exportVideoClips(
                             context = context,
                             clips = clips,
+                            videoAspectRatio = videoAspectRatio,
                             audioUri = audioUri,
                             audioStartMs = audioStartMs,
                             audioDurationMs = audioDurationMs,
@@ -1705,6 +1706,7 @@ fun formatTime(ms: Long): String {
 fun exportVideoClips(
     context: Context,
     clips: List<VideoClip>,
+    videoAspectRatio: Float,
     audioUri: Uri?,
     audioStartMs: Long,
     audioDurationMs: Long,
@@ -1731,9 +1733,12 @@ fun exportVideoClips(
     val rawDuration = clips.sumOf { it.durationMs }.coerceAtLeast(500L)
     val effectiveDuration = estimateCurveDurationMs(rawDuration, speedPoints)
 
-    // Presentation(1080) placed BEFORE TextOverlay so video & text both render crisp at Full HD
+    val isPortrait = if (rotationDegrees % 180 != 0) videoAspectRatio > 1f else videoAspectRatio < 1f
+    val outWidth = if (isPortrait) 1080 else 1920
+    val outHeight = if (isPortrait) 1920 else 1080
+
     val commonVideoEffects = buildExportVideoEffects(filter, brightness, contrast, saturation, rotationDegrees) +
-        listOf(Presentation.createForShortSide(1080)) +
+        listOf(Presentation.createForWidthAndHeight(outWidth, outHeight, Presentation.LAYOUT_SCALE_TO_FIT)) +
         buildTextExportEffects(
             text = overlayText,
             anchorX = textAnchorX,
@@ -1770,7 +1775,7 @@ fun exportVideoClips(
         builder.build()
     }
 
-    // 20 Mbps VBR Full HD Encoder for crisp VN-level clarity
+    // 20 Mbps VBR Full HD Encoder for crisp clarity
     val encoderFactory = DefaultEncoderFactory.Builder(context)
         .setRequestedVideoEncoderSettings(
             VideoEncoderSettings.Builder()
@@ -1789,12 +1794,7 @@ fun exportVideoClips(
                 try {
                     saveToGallery(context, tempFile)
                     tempFile.delete()
-                    val resInfo = if (exportResult.width > 0 && exportResult.height > 0) {
-                        "${exportResult.width}x${exportResult.height} Full HD"
-                    } else {
-                        "1080p Full HD"
-                    }
-                    onSuccess(resInfo)
+                    onSuccess("${outWidth}x${outHeight} Full HD")
                 } catch (e: Exception) {
                     onError(e.message ?: "Save failed")
                 }
